@@ -1,3 +1,6 @@
+logical-plan.gv
+dump.rdb
+
 # virtual environments for python and julia
 venv/
 .playground/
