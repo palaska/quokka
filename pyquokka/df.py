@@ -3,14 +3,17 @@ import copy
 import polars
 import pyarrow.csv as csv
 import pyquokka.sql_utils as sql_utils
-from pyquokka.datastream import * 
-from pyquokka.orderedstream import * 
+from pyquokka.datastream import *
+from pyquokka.orderedstream import *
 from pyquokka.catalog import *
 import pyarrow.parquet as pq
 from pyarrow.fs import S3FileSystem
 import os
 
-class QuokkaContext:
+from typing import Optional, Set, Dict, List
+from pyquokka.types import ExplainMode, IDataSet, IQuokkaContext, IpAddress, NodeId, Schema, SourceDataStreamIndex, TaskManagerId
+
+class QuokkaContext(IQuokkaContext):
     def __init__(self, cluster = None, io_per_node = 2, exec_per_node = 1) -> None:
 
         """
@@ -20,10 +23,10 @@ class QuokkaContext:
             cluster (Cluster): Cluster object. If None, a LocalCluster will be created.
             io_per_node (int): Number of IO nodes to launch per machine. Default is 2. This controls the number of IO thread pools to use per machine.
             exec_per_node (int): Number of compute nodes to launch per machine. Default is 1. This controls the number of compute thread pools to use per machine.
-        
+
         Returns:
             QuokkaContext object
-        
+
         Examples:
 
             >>> from pyquokka.df import QuokkaContext
@@ -62,11 +65,11 @@ class QuokkaContext:
 
         self.sql_config= {"optimize_joins" : True, "s3_csv_materialize_threshold" : 10 * 1048576, "disk_csv_materialize_threshold" : 1048576,
                       "s3_parquet_materialize_threshold" : 10 * 1048576, "disk_parquet_materialize_threshold" : 1048576}
-        self.exec_config = {"hbq_path": "/data/", "fault_tolerance": False, "memory_limit": 0.1, "max_pipeline_batches": 30, "blocking" : False, 
+        self.exec_config = {"hbq_path": "/data/", "fault_tolerance": False, "memory_limit": 0.1, "max_pipeline_batches": 30, "blocking" : False,
                         "checkpoint_interval": None, "checkpoint_bucket": "quokka-checkpoint", "batch_attempt": 20, "max_pipeline": 300}
 
-        self.latest_node_id = 0
-        self.nodes = {}
+        self.latest_node_id: NodeId = 0
+        self.nodes: Dict[NodeId, Node] = {}
         self.cluster = LocalCluster() if cluster is None else cluster
         if type(self.cluster) == LocalCluster:
             if self.exec_config["fault_tolerance"]:
@@ -79,23 +82,26 @@ class QuokkaContext:
         self.catalog = Catalog.options(num_cpus=0.001,resources={"node:" + str(self.cluster.leader_private_ip): 0.001}).remote()
         self.dataset_manager = ArrowDataset.options(num_cpus = 0.001, resources={"node:" + str(self.cluster.leader_private_ip): 0.001}).remote()
 
-        self.task_managers = {}
-        self.node_locs= {}
-        self.io_nodes = set()
-        self.compute_nodes = set()
-        self.replay_nodes = set()
+        self.task_managers: Dict[TaskManagerId, ITaskManager] = {}
+        self.node_locs: Dict[TaskManagerId, IpAddress] = {}
+        self.io_nodes: Set[TaskManagerId] = set()
+        self.compute_nodes: Set[TaskManagerId] = set()
+        self.replay_nodes: Set[TaskManagerId] = set()
         count = 0
 
         self.tag_io_nodes = {k: set() for k in self.cluster.tags}
         self.tag_compute_nodes = {k: set() for k in self.cluster.tags}
 
-        self.leader_compute_nodes = []
-        self.leader_io_nodes = []
+        self.leader_compute_nodes: List[TaskManagerId] = []
+        self.leader_io_nodes: List[TaskManagerId] = []
+
+        # @palaska: nodes that will be used in the query execution
+        self.execution_nodes: Dict[NodeId, Node] = {}
 
         # default strategy launches two IO nodes and one compute node per machine
-        private_ips = list(self.cluster.private_ips.values())
+        private_ips: List[IpAddress] = list(self.cluster.private_ips.values())
         for ip in private_ips:
-            
+
             for k in range(1):
                 self.task_managers[count] = ReplayTaskManager.options(num_cpus = 0.001, max_concurrency = 2, resources={"node:" + ip : 0.001}).remote(count, self.cluster.leader_public_ip, list(self.cluster.private_ips.values()), self.exec_config)
                 self.replay_nodes.add(count)
@@ -116,7 +122,7 @@ class QuokkaContext:
                 if type(self.cluster) == LocalCluster:
                     self.task_managers[count] = ExecTaskManager.options(num_cpus = 0.001,  max_concurrency = 2, resources={"node:" + ip : 0.001}).remote(count, self.cluster.leader_public_ip, list(self.cluster.private_ips.values()), self.exec_config)
                 elif type(self.cluster) == EC2Cluster:
-                    self.task_managers[count] = ExecTaskManager.options(num_cpus = 0.001,  max_concurrency = 2, resources={"node:" + ip : 0.001}).remote(count, self.cluster.leader_public_ip, list(self.cluster.private_ips.values()), self.exec_config) 
+                    self.task_managers[count] = ExecTaskManager.options(num_cpus = 0.001,  max_concurrency = 2, resources={"node:" + ip : 0.001}).remote(count, self.cluster.leader_public_ip, list(self.cluster.private_ips.values()), self.exec_config)
                 else:
                     raise Exception
 
@@ -125,10 +131,10 @@ class QuokkaContext:
                 for tag in self.cluster.tags:
                     if ip in self.cluster.tags[tag]:
                         self.tag_compute_nodes[tag].add(count)
-                
+
                 self.compute_nodes.add(count)
                 self.node_locs[count] = ip
-                count += 1        
+                count += 1
 
         ray.get(self.coordinator.register_nodes.remote(replay_nodes = {k: self.task_managers[k] for k in self.replay_nodes}, io_nodes = {k: self.task_managers[k] for k in self.io_nodes}, compute_nodes = {k: self.task_managers[k] for k in self.compute_nodes}))
         ray.get(self.coordinator.register_node_ips.remote( self.node_locs ))
@@ -160,7 +166,7 @@ class QuokkaContext:
 
         Returns:
             None
-        
+
         Examples:
 
             >>> from pyquokka.df import *
@@ -170,10 +176,10 @@ class QuokkaContext:
 
             >>> qc.set_config("optimize_joins", True)
 
-            Turn off fault tolerance. 
+            Turn off fault tolerance.
 
             >>> qc.set_config("fault_tolerance", False)
-        
+
         """
 
         if key in self.sql_config:
@@ -183,7 +189,7 @@ class QuokkaContext:
             assert all(ray.get([task_manager.set_config.remote(key, value) for task_manager in self.task_managers.values()]))
         else:
             raise Exception("key not found in config")
-    
+
     def get_config(self, key):
 
         """
@@ -200,7 +206,7 @@ class QuokkaContext:
             >>> from pyquokka.df import *
             >>> qc = QuokkaContext()
             >>> qc.get_config("optimize_joins")
-        
+
         """
 
         if key in self.sql_config:
@@ -245,7 +251,7 @@ class QuokkaContext:
                 self.nodes[self.latest_node_id] = InputDiskFilesNode(table_location, ["filename","object"])
             else:
                 raise NotImplemented("Are you trying to read a single file? It's not supported. Please supply absolute directory to the files, like /tmp/*. Add the asterisk!")
-            
+
             # if local, you should not launch too many actors since not that many needed to saturate disk
             # self.nodes[self.latest_node_id].set_placement_strategy(CustomChannelsStrategy(2))
 
@@ -261,30 +267,30 @@ class QuokkaContext:
     After it has done these things, if the dataset is not materialized, we will instantiate a logical plan node and return a DataStream
     '''
 
-    def read_csv(self, table_location: str, schema = None, has_header = False, sep=","):
+    def read_csv(self, table_location: str, schema: Optional[Schema] = None, has_header = False, sep=",") -> DataStream:
 
         """
         Read in a CSV file or files from a table location. It can be a single CSV or a list of CSVs. It can be CSV(s) on disk
-        or CSV(s) on S3. Currently other clouds are not supported. The CSVs can have a predefined schema using a list of 
-        column names in the schema argument, or you can specify the CSV has a header row and Quokka will read the schema 
-        from it. You should also specify the CSV's separator. 
+        or CSV(s) on S3. Currently other clouds are not supported. The CSVs can have a predefined schema using a list of
+        column names in the schema argument, or you can specify the CSV has a header row and Quokka will read the schema
+        from it. You should also specify the CSV's separator.
 
         Args:
             table_location (str): where the CSV(s) are. This mostly mimics Spark behavior. Look at the examples.
             schema (list): you can provide a list of column names, it's kinda like polars.read_csv(new_columns=...)
-            has_header (bool): is there a header row. If the schema is not provided, this should be True. If the schema IS provided, 
+            has_header (bool): is there a header row. If the schema is not provided, this should be True. If the schema IS provided,
                 this can still be True. Quokka will just ignore the header row.
             sep (str): default to ',' but could be something else, like '|' for TPC-H tables
 
         Return:
             A DataStream.
-        
+
         Examples:
 
             Read a single CSV. It's better always to specify the absolute path.
             >>> lineitem = qc.read_csv("/home/ubuntu/tpch/lineitem.csv")
 
-            Read a directory of CSVs 
+            Read a directory of CSVs
             >>> lineitem = qc.read_csv("/home/ubuntu/tpch/lineitem/*")
 
             Read a single CSV from S3
@@ -295,7 +301,7 @@ class QuokkaContext:
             ~~~
         """
 
-        def get_schema_from_bytes(resp):
+        def get_schema_from_bytes(resp) -> Schema:
             first_newline = resp.find(bytes('\n', 'utf-8'))
             if first_newline == -1:
                 raise Exception("could not detect the first line break with first 4 kb")
@@ -304,7 +310,7 @@ class QuokkaContext:
                 resp = resp[:-1]
             schema = resp.decode("utf-8").split(sep)
             return schema
-    
+
         def return_materialized_stream(where, my_schema = None):
             if has_header:
                 df = polars.read_csv(where, has_header = True,separator = sep)
@@ -351,7 +357,7 @@ class QuokkaContext:
                 token = ray.get(self.catalog.register_s3_csv_source.remote(bucket, files[0], schema, sep, sum(sizes)))
                 self.nodes[self.latest_node_id] = InputS3CSVNode(bucket, prefix, None, schema, sep, has_header)
                 self.nodes[self.latest_node_id].set_catalog_id(token)
-                
+
             else:
                 key = "/".join(table_location.split("/")[1:])
                 s3 = boto3.client('s3')
@@ -367,7 +373,7 @@ class QuokkaContext:
 
                 if size < 10 * 1048576:
                     return return_materialized_stream("s3://" + table_location, schema)
-                
+
                 token = ray.get(self.catalog.register_s3_csv_source.remote(bucket, key, schema, sep, size))
                 self.nodes[self.latest_node_id] = InputS3CSVNode(bucket, None, key, schema, sep, has_header)
                 self.nodes[self.latest_node_id].set_catalog_id(token)
@@ -402,11 +408,11 @@ class QuokkaContext:
                     schema = get_schema_from_bytes(resp)
                 if size < self.sql_config["disk_csv_materialize_threshold"]:
                     return return_materialized_stream(table_location, schema)
-                
+
                 token = ray.get(self.catalog.register_disk_csv_source.remote(table_location, schema, sep))
                 self.nodes[self.latest_node_id] = InputDiskCSVNode(table_location, schema, sep, has_header)
                 self.nodes[self.latest_node_id].set_catalog_id(token)
-            
+
         self.latest_node_id += 1
         return DataStream(self, schema, self.latest_node_id - 1)
 
@@ -414,7 +420,7 @@ class QuokkaContext:
 
         """
         Read Parquet. It can be a single Parquet or a list of Parquets. It can be Parquet(s) on disk
-        or Parquet(s) on S3. Currently other clouds are not supported. 
+        or Parquet(s) on S3. Currently other clouds are not supported.
 
         Args:
             table_location (str): where the Parquet(s) are. This mostly mimics Spark behavior. Look at the examples.
@@ -424,13 +430,13 @@ class QuokkaContext:
 
         Return:
             DataStream.
-        
+
         Examples:
-            
+
             Read a single Parquet. It's better always to specify the absolute path.
             >>> lineitem = qc.read_parquet("/home/ubuntu/tpch/lineitem.parquet")
 
-            Read a directory of Parquets 
+            Read a directory of Parquets
             >>> lineitem = qc.read_parquet("/home/ubuntu/tpch/lineitem/*")
 
             Read a single Parquet from S3
@@ -478,13 +484,13 @@ class QuokkaContext:
                         return return_materialized_stream(df.with_columns(polars.lit(files[0].split("/")[-1].replace(".parquet",""))).alias(name_column))
                     else:
                         return return_materialized_stream(df)
-                
+
                 try:
                     f = pq.ParquetFile(S3FileSystem().open_input_file(files[0]))
                     schema = [k.name for k in f.schema_arrow]
                 except:
                     raise Exception("schema discovery failed for Parquet dataset at location {}. Please raise Github issue.".format(table_location))
-                
+
                 if name_column is not None:
                     assert name_column not in schema, "name_column already exists in Parquet columns"
                     schema.append(name_column)
@@ -496,7 +502,7 @@ class QuokkaContext:
                     f = pq.ParquetFile(S3FileSystem().open_input_file(table_location))
                     schema = [k.name for k in f.schema_arrow]
                 except:
-                    raise Exception("""schema discovery failed for Parquet dataset at location {}. 
+                    raise Exception("""schema discovery failed for Parquet dataset at location {}.
                                     Note if you are specifying a prefix to many parquet files, must use asterix. E.g.
                                     qc.read_parquet("s3://rottnest/happy.parquet/*")""".format(table_location))
                 key = "/".join(table_location.split("/")[1:])
@@ -509,7 +515,7 @@ class QuokkaContext:
                         return return_materialized_stream(df.with_columns(polars.lit(key.split("/")[-1].replace(".parquet",""))).alias(name_column))
                     else:
                         return return_materialized_stream(df)
-                
+
                 token = ray.get(self.catalog.register_s3_parquet_source.remote(bucket + "/" + key, 1))
                 if name_column is not None:
                     assert name_column not in schema, "name_column already exists in Parquet columns"
@@ -523,7 +529,7 @@ class QuokkaContext:
                 raise NotImplementedError("Does not support reading local dataset with S3 cluster. Must use S3 bucket.")
             if name_column is not None:
                 raise NotImplementedError("Does not support name_column for local dataset yet.")
-            
+
             if "*" in table_location:
                 table_location = table_location[:-1]
                 assert table_location[-1] == "/", "must specify * with entire directory, doesn't support prefixes yet"
@@ -537,7 +543,7 @@ class QuokkaContext:
                 if len(files) == 1 and os.path.getsize(table_location + files[0]) < self.sql_config["disk_parquet_materialize_threshold"]:
                     df = polars.read_parquet(table_location + files[0])
                     return return_materialized_stream(df)
-                
+
                 token = ray.get(self.catalog.register_disk_parquet_source.remote(table_location))
                 self.nodes[self.latest_node_id] = InputDiskParquetNode(table_location, schema)
                 self.nodes[self.latest_node_id].set_catalog_id(token)
@@ -547,11 +553,11 @@ class QuokkaContext:
                     size = os.path.getsize(table_location)
                 except:
                     raise Exception("could not find the parquet file at ", table_location)
-                
+
                 if size < self.sql_config["disk_parquet_materialize_threshold"]:
                     df = polars.read_parquet(table_location)
                     return return_materialized_stream(df)
-                
+
                 f = pq.ParquetFile(table_location)
                 schema = [k.name for k in f.schema_arrow]
                 token = ray.get(self.catalog.register_disk_parquet_source.remote(table_location))
@@ -564,7 +570,7 @@ class QuokkaContext:
     def read_lance(self, table_location: str, vec_column: str):
 
         """
-        
+
         """
 
         try:
@@ -593,14 +599,14 @@ class QuokkaContext:
                     files.extend(["s3://" + bucket + "/" + i['Prefix'] for i in z['CommonPrefixes'] if i['Prefix'].endswith(".lance/")])
 
                 assert len(files) > 0, "could not find any lance files. make sure they end with .lance"
-                
+
                 try:
                     schema = lance.dataset(files[0]).schema.names
                     assert vec_column in schema, "vector column not found in schema"
                 except:
                     raise Exception("""schema discovery failed for Parquet dataset at location {}. Please raise Github issue.
                                     Lance dataset with S3 does not work with creds set with AWS configure, must use env variables.""".format(table_location))
-                
+
                 # token = ray.get(self.catalog.register_s3_lance_source.remote(files[0], len(sizes)))
                 self.nodes[self.latest_node_id] = InputLanceNode(files, schema, vec_column)
                 # self.nodes[self.latest_node_id].set_catalog_id(token)
@@ -609,7 +615,7 @@ class QuokkaContext:
                     schema = lance.dataset(files[0]).schema.names
                     assert vec_column in schema, "vector column not found in schema"
                 except:
-                    raise Exception("""schema discovery failed for Parquet dataset at location {}. 
+                    raise Exception("""schema discovery failed for Parquet dataset at location {}.
                                     Lance dataset with S3 does not work with creds set with AWS configure, must use env variables.
                                     Note if you are specifying a prefix to many parquet files, must use asterix. E.g.
                                     qc.read_parquet("s3://rottnest/happy.parquet/*")""".format(table_location))
@@ -623,7 +629,7 @@ class QuokkaContext:
         else:
             if type(self.cluster) == EC2Cluster:
                 raise NotImplementedError("Does not support reading local dataset with S3 cluster. Must use S3 bucket.")
-            
+
             if "*" in table_location:
                 table_location = table_location[:-1]
                 assert table_location[-1] == "/", "must specify * with entire directory, doesn't support prefixes yet"
@@ -638,8 +644,8 @@ class QuokkaContext:
                 # self.nodes[self.latest_node_id].set_catalog_id(token)
 
             else:
-                
-                
+
+
                 try:
                     schema = lance.dataset(table_location).schema.names
                 except:
@@ -650,13 +656,13 @@ class QuokkaContext:
 
         self.latest_node_id += 1
         return DataStream(self, schema, self.latest_node_id - 1)
-    
+
 
     def read_rest_post(self, url, data, schema, headers = {}, batch_size = 10000):
         self.nodes[self.latest_node_id] = InputRestPostAPINode(url, data, headers, schema, batch_size = batch_size)
         self.latest_node_id += 1
         return DataStream(self, schema, self.latest_node_id - 1)
-    
+
     def read_rest_get(self, url, data, schema, headers = {}, batch_size = 10000):
         self.nodes[self.latest_node_id] = InputRestGetAPINode(url, data, headers, schema, batch_size = batch_size)
         self.latest_node_id += 1
@@ -677,7 +683,7 @@ class QuokkaContext:
 
             >>> ds = qc.read_parquet("s3://my-bucket/my-data.parquet").compute()
 
-            `ds` will be a DataSet, i.e. a collection of Ray ObjectRefs. 
+            `ds` will be a DataSet, i.e. a collection of Ray ObjectRefs.
 
             >>> ds = qc.read_dataset(ds)
 
@@ -710,17 +716,17 @@ class QuokkaContext:
         return self.read_dataset(my_dataset)
 
 
-    def from_polars(self, df):
+    def from_polars(self, df: polars.DataFrame | polars.Series) -> DataStream:
 
         """
         Create a DataStream from a polars DataFrame. The DataFrame will be materialized. If you don't know what this means, don't worry about it.
 
         Args:
             df (Polars DataFrame): The polars DataFrame to create the DataStream from.
-        
+
         Returns:
             DataStream: The DataStream created from the polars DataFrame.
-        
+
         Examples:
 
             >>> import polars as pl
@@ -735,7 +741,7 @@ class QuokkaContext:
         self.latest_node_id += 1
         return DataStream(self, df.columns, self.latest_node_id - 1, materialized=True)
 
-    def from_pandas(self, df):
+    def from_pandas(self, df) -> DataStream:
 
         """
         Create a DataStream from a pandas DataFrame. The DataFrame will be materialized. If you don't know what this means, don't worry about it.
@@ -768,10 +774,10 @@ class QuokkaContext:
 
         Args:
             df (PyArrow Table): The polars DataFrame to create the DataStream from.
-        
+
         Returns:
             DataStream: The DataStream created from the polars DataFrame.
-        
+
         Examples:
 
             >>> import polars as pl
@@ -780,7 +786,7 @@ class QuokkaContext:
             >>> df = pl.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}).to_arrow()
             >>> stream = qc.from_arrow(df)
             >>> stream.count()
-        
+
         """
 
         self.nodes[self.latest_node_id] = InputPolarsNode(polars.from_arrow(df))
@@ -793,7 +799,7 @@ class QuokkaContext:
         stream = self.read_parquet(table_location, nthreads = nthreads, name_column=name_col)
         assert sorted_by in stream.schema, f"sorted_by column {sorted_by} not in schema {stream.schema}"
         return OrderedStream(stream, {sorted_by : sort_order})
-    
+
     def read_sorted_csv(self, table_location: str,sorted_by: str, schema = None, has_header = False, sep=","):
         assert type(sorted_by) == str
         stream = self.read_csv(table_location, schema, has_header, sep)
@@ -802,15 +808,15 @@ class QuokkaContext:
     def read_iceberg(self, table, snapshot = None):
 
         """
-        Must have pyiceberg installed on the client. This is a new API. This only supports AWS Glue catalog so far. 
+        Must have pyiceberg installed on the client. This is a new API. This only supports AWS Glue catalog so far.
 
         Args:
             table (str): The table name to read from. This is the full table name, not just the table name. For example, if the table is in the database "default" and the table name is "my_table", then the table name should be "default.my_table".
             snapshot (int): The snapshot ID to read from. If this is not specified, the latest snapshot will be read from.
-        
+
         Returns:
             DataStream: The DataStream created from the iceberg table.
-        
+
         Examples:
 
             >>> from pyquokka.df import QuokkaContext
@@ -851,17 +857,17 @@ class QuokkaContext:
     this is expected to be internal API, well internal as much as it can I guess until the syntactic sugar runs out.
     Although one should not expect average users to know how to use this API without shooting themselves in the foot.
     sources: Dict[Int -> DataStream]. The key is the identifier of the DataStream that the operator in your Node expects.
-        i.e. if you Node has an operator that takes two streams identified by 0 and 1, then your keys here will be 0 or 1. 
+        i.e. if you Node has an operator that takes two streams identified by 0 and 1, then your keys here will be 0 or 1.
         Again this is quite confusing and not expected to be used correctly by general population.
     partitioners: Dict[Int -> Partitioner]. The partitioning strategy for each input DataStream to this node. The value is one of the
         Partitioner classes in target_info.py
-    node: A Node object, the logical plan node you plan to add here that processes the input DataStreams. 
-    schema: a list of column names. This might be changed to a dictionary with type information in the future. 
+    node: A Node object, the logical plan node you plan to add here that processes the input DataStreams.
+    schema: a list of column names. This might be changed to a dictionary with type information in the future.
     ordering: currently this is not supported. If ordering is specified, then the Quokka runtime will ensure that one input stream
         is entirely drained by this node before the other input stream starts to be processed. This can be used to implement build-probe join, e.g.
         implementing this is a priority.
     '''
-    def new_stream(self, sources: dict, partitioners: dict, node, schema: list, sorted = None, materialized = False):
+    def new_stream(self, sources: Dict[SourceDataStreamIndex, DataStream], partitioners: Dict[SourceDataStreamIndex, Partitioner], node: Node, schema: Schema, sorted: Optional[dict] = None, materialized: bool = False) -> DataStream:
         self.nodes[self.latest_node_id] = node
         for source in sources:
             source_datastream = sources[source]
@@ -877,14 +883,16 @@ class QuokkaContext:
             return OrderedStream(DataStream(self, schema, self.latest_node_id - 1, sorted, materialized), sorted)
 
     '''
-    This defines a dataset object which is used by the optimizer. 
+    This defines a dataset object which is used by the optimizer.
     '''
-    def new_dataset(self, source, schema: list):
+    def new_dataset(self, source: DataStream, schema: Schema) -> 'DataSet':
         stream = self.new_stream(sources={0: source}, partitioners={
                                  0: PassThroughPartitioner()}, node=DataSetNode(schema), schema=schema)
         return DataSet(self, schema, stream.source_node_id)
 
-    def optimize(self, node_id):
+    # @palaska: optimize seems to be only called on the sink node (root of the logical plan)
+    # and it returns the new root node id of the optimized tree
+    def optimize(self, node_id: NodeId) -> NodeId:
         self.__push_ann__()
         self.__push_filter__(node_id)
         self.__early_projection__(node_id)
@@ -893,11 +901,13 @@ class QuokkaContext:
             self.__merge_joins__(node_id)
         self.__propagate_cardinality__(node_id)
         self.__determine_stages__(node_id)
-        
+
         assert len(self.execution_nodes[node_id].parents) == 1
+        # @palaska: get the only parent datastream index, which is probably 0
         parent_idx = list(self.execution_nodes[node_id].parents)[0]
         parent_id = self.execution_nodes[node_id].parents[parent_idx]
 
+        # @palaska: no idea what we are doing here. Why are we removing the sink node if it's parent is not a source node?
         if issubclass(type(self.execution_nodes[parent_id]), SourceNode):
             self.execution_nodes[node_id].blocking = True
             return node_id
@@ -907,21 +917,25 @@ class QuokkaContext:
             return parent_id
 
 
-    def lower(self, end_node_id, collect = True, dataset_schema = None):
+    def lower(self, end_node_id: NodeId, collect = True, dataset_schema = None) -> Dataset | polars.DataFrame | polars.Series:
 
         # start = time.time()
         task_graph = TaskGraph(self)
         node = self.execution_nodes[end_node_id]
         nodes = deque([node])
         reverse_sorted_nodes = [(end_node_id,node)]
+        # @palaska: breadth first traversal of the plan, prioritizing lhs
         while len(nodes) > 0:
             new_node = nodes.popleft()
+            # @palaska: here parents are the input datastreams of the node
             for parent_idx in new_node.parents:
                 parent_id = new_node.parents[parent_idx]
                 reverse_sorted_nodes.append((parent_id,self.execution_nodes[parent_id]))
                 nodes.append(self.execution_nodes[parent_id])
+
+        # @palaska: now we have the list of nodes starting from the lowest level of the tree
         reverse_sorted_nodes = reverse_sorted_nodes[::-1]
-        task_graph_nodes = {}
+        task_graph_nodes: Dict[NodeId, TaskGraphNodeId] = {}
 
         for node_id, node in reverse_sorted_nodes:
             if issubclass(type(node), SourceNode):
@@ -944,13 +958,13 @@ class QuokkaContext:
         else:
             assert dataset_schema is not None
             return Dataset(dataset_schema, self.dataset_manager, result)
-                    
 
-    def execute_node(self, node_id, explain = False, mode = None, collect = True):
+
+    def execute_node(self, node_id, explain = False, mode: ExplainMode = None, collect = True) -> Dataset | polars.DataFrame | polars.Series | None:
         assert issubclass(type(self.nodes[node_id]), SinkNode)
 
-        # we will now make a copy of the nodes involved in the computation. 
-        
+        # we will now make a copy of the nodes involved in the computation.
+
         end_schema = self.nodes[node_id].schema
         node = self.nodes[node_id]
         nodes = deque([node])
@@ -962,7 +976,7 @@ class QuokkaContext:
                 parent_id = new_node.parents[parent_idx]
                 self.execution_nodes[parent_id] = copy.deepcopy(self.nodes[parent_id])
                 nodes.append(self.nodes[parent_id])
-        
+
         # prune targets from execution nodes that are not related to this execution
         execution_node_set = set(self.execution_nodes.keys())
         for execute_node_id in self.execution_nodes:
@@ -973,24 +987,24 @@ class QuokkaContext:
                 if target_id in execution_node_set:
                     # only deleting the target in the node in execution_nodes, not in nodes!
                     new_targets[target_id] = node.targets[target_id]
-            
+
             if len(new_targets) > 1:
                 raise Exception("Currently a DataStream can only have one downstream consumer, please file an issue!")
             node.targets = new_targets
 
-        
+
         #self.explain(node_id)
 
-        new_node_id = self.optimize(node_id)       
+        new_node_id = self.optimize(node_id)
         #self.explain(new_node_id)
-    
+
         if explain:
             self.explain(new_node_id, mode = mode)
             return None
         else:
             return self.lower(new_node_id, collect = collect, dataset_schema = end_schema)
 
-    def explain(self, node_id, mode="graph"):
+    def explain(self, node_id: NodeId, mode: ExplainMode ="graph"):
 
         if mode == "text":
             print(node_id, self.execution_nodes[node_id])
@@ -1106,7 +1120,7 @@ class QuokkaContext:
                     )
                     new_conjuncts = []
                     for conjunct in conjuncts:
-                        
+
                         columns = set(i.name for i in conjunct.find_all(
                             sqlglot.expressions.Column))
                         conjunct_schema_mappings = { col : node.schema_mapping[col] for col in columns }
@@ -1115,7 +1129,7 @@ class QuokkaContext:
                         conjunct_parents = {col: set(conjunct_schema_mappings[col].keys()) for col in columns}
                         # we need to make sure that all the values in conjunct_parents are the same, otherwise we cannot push this predicate down
                         parents = conjunct_parents[list(conjunct_parents.keys())[0]]
-                        
+
                         if all([parents == conjunct_parents[col] for col in conjunct_parents]) and -1 not in parents:
                             for parent in parents:
                                 copied_conjunct = copy.deepcopy(conjunct)
@@ -1136,7 +1150,7 @@ class QuokkaContext:
 
                     for parent in node.parents:
                         self.__push_filter__(node.parents[parent])
-                    return 
+                    return
 
     def __early_projection__(self, node_id):
 
@@ -1156,10 +1170,10 @@ class QuokkaContext:
                         targets[target_id].projection)
                     predicate_required_columns = predicate_required_columns.union(
                         targets[target_id].predicate_required_columns())
-                
-                # the node.required_columns for this input node is the union of the required columns of 
+
+                # the node.required_columns for this input node is the union of the required columns of
                 node.projection = projection.union(predicate_required_columns)
-                
+
                 # still do the extra projection to ensure columns appear in the right order.
                 #for target_id in targets:
                 #    if targets[target_id].projection == node.projection:
@@ -1260,21 +1274,21 @@ class QuokkaContext:
 
                         parent.targets[node_id].projection = pushed_projections[parent_id]
                     self.__early_projection__(parent_id)
-    
+
     def __push_ann__(self):
 
         ann_nodes = []
         for node_id in self.execution_nodes:
             if issubclass(type(self.execution_nodes[node_id]), NearestNeighborFilterNode):
                 ann_nodes.append(node_id)
-        
+
         for node_id in ann_nodes:
 
             node = self.execution_nodes[node_id]
             targets = copy.deepcopy(node.targets)
             assert len(node.parents) == 1 and len(targets) != 0
             # figure out which source node is the parent by walking the graph. currently the vector must come from a source node. It cannot be generated by something.
-            
+
             curr_node_id = node.parents[0]
             curr_col_name = node.vec_column
             curr_target_id = node_id
@@ -1292,14 +1306,14 @@ class QuokkaContext:
                         curr_node_id = self.execution_nodes[curr_node_id].parents[my_parent]
                         curr_col_name = interested[my_parent]
                         curr_target_id = self.execution_nodes[curr_node_id]
-            
+
             # curr_node_id and col_name should now be the source node and the column name of the vector
 
             if issubclass(type(self.execution_nodes[curr_node_id]), InputLanceNode):
-                
+
                 lance_node = self.execution_nodes[curr_node_id]
                 lance_node.set_probe_df(copy.deepcopy(node.probe_df), node.probe_vector_col , node.k)
-                
+
                 # delete yourself
                 parent = self.execution_nodes[node.parents[0]]
                 for target_id in targets:
@@ -1335,7 +1349,7 @@ class QuokkaContext:
                 #             break
                 #     assert success
                 # node.targets = {}
-                
+
                 # # now insert yourself between curr_node_id and curr_target_id
 
                 # self.execution_nodes[curr_node_id].targets[node_id] = TargetInfo(PassThroughPartitioner(), None, None, [])
@@ -1400,11 +1414,11 @@ class QuokkaContext:
 
     def __merge_joins__(self, node_id):
 
-        # the goal of this pass is to merge join nodes into a virtual multi join node and then 
+        # the goal of this pass is to merge join nodes into a virtual multi join node and then
         # relower the multi join node into a series of join nodes.
         # we need to first perform a DFS traversal to find all the join nodes
         # and merge them along the way
-        # we also need to handle the predicates and projections along the way. This pass is done 
+        # we also need to handle the predicates and projections along the way. This pass is done
         # after projection and predicate pushdown.
 
         node = self.execution_nodes[node_id]
@@ -1431,7 +1445,7 @@ class QuokkaContext:
                 target_id = list(targets.keys())[0]
 
                 # you have one target, you can be fused. first figure out how many of your parents are join nodes.
-                
+
                 while True:
                     new_parents = {-1: None}
                     not_done = False
@@ -1466,15 +1480,15 @@ class QuokkaContext:
                                 else:
                                     node.targets[target_id].predicate = optimizer.simplify.simplify(sqlglot.exp.and_(
                                         node.targets[target_id].predicate, parent_node.targets[node_id].predicate))
-                            
+
                             del self.execution_nodes[parents[parent]]
-                            # don't have to worry about the parent's projections. You only care about your projections, 
+                            # don't have to worry about the parent's projections. You only care about your projections,
                             # i.e. the one you need at the very end.
                         else:
                             new_parent_key = max(new_parents.keys()) + 1
                             new_parents[new_parent_key] = parents[parent]
                             source_mapping[parent] = new_parent_key
-                    
+
                     renamed_join_specs = []
                     for join_spec in old_join_specs:
                         new_join_spec = {}
@@ -1493,13 +1507,13 @@ class QuokkaContext:
                             new_join_spec[new_key] = join_spec[1][key]
                         renamed_join_specs.append((join_spec[0], new_join_spec))
                     node.join_specs = renamed_join_specs + new_join_specs
-                    
+
                     del new_parents[-1]
                     parents = new_parents
                     if not not_done:
                         break
                     # print(node.join_specs)
-                
+
                 node.parents = parents
 
                 for parent in parents:
@@ -1511,7 +1525,7 @@ class QuokkaContext:
                     parent_id = node.parents[parent_idx]
                     self.__merge_joins__(parent_id)
                 return
-    
+
     def __propagate_cardinality__(self, node_id):
 
         node = self.execution_nodes[node_id]
@@ -1544,7 +1558,7 @@ class QuokkaContext:
             return
         else:
             if issubclass(type(node), JoinNode):
-                
+
                 # check if everything is an inner join
 
                 if all([join_spec[0] == "inner" for join_spec in node.join_specs]):
@@ -1566,7 +1580,7 @@ class QuokkaContext:
                                 self.execution_nodes[parents[parent]].assign_stage(node.stage - 1)
                             else:
                                 self.execution_nodes[parents[parent]].assign_stage(node.stage - 2)
-                    
+
                     # you are now responsible for arranging the joinspec in the right order!
                     # you should have a join_specs attribute
                     new_join_specs = []
@@ -1594,13 +1608,13 @@ class QuokkaContext:
                     node.join_specs = new_join_specs
                     # print(new_join_specs)
                 else:
-                    # there are some joins that are not inner joins 
+                    # there are some joins that are not inner joins
                     # currently we do not attempt to reorder them, in fact we can only tolerate one join here. haha.
                     assert len(node.join_specs) == 1, "There are multiple joins and some of them are not inner joins, blowing up"
                     assert len(parents) == 2 and 0 in parents and 1 in parents
                     join_spec = node.join_specs[0]
                     # in a semi, anti or left join, 0 needs to be probe.
-                    node.join_specs = [(join_spec[0], [(0, join_spec[1][0]), (1, join_spec[1][1])])] 
+                    node.join_specs = [(join_spec[0], [(0, join_spec[1][0]), (1, join_spec[1][1])])]
                     if not self.exec_config["blocking"]:
                         self.execution_nodes[parents[0]].assign_stage(node.stage)
                         self.execution_nodes[parents[1]].assign_stage(node.stage - 1)
@@ -1608,7 +1622,7 @@ class QuokkaContext:
                         self.execution_nodes[parents[0]].assign_stage(node.stage - 1)
                         self.execution_nodes[parents[1]].assign_stage(node.stage - 2)
 
-            
+
             else:
                 # for other nodes we currently don't do anything
                 for parent in parents:
@@ -1616,12 +1630,12 @@ class QuokkaContext:
                         self.execution_nodes[parents[parent]].assign_stage(node.stage)
                     else:
                         self.execution_nodes[parents[parent]].assign_stage(node.stage - 1)
-        
+
         for parent in parents:
             self.__determine_stages__(parents[parent])
 
-class DataSet:
-    def __init__(self, quokka_context: QuokkaContext, schema: dict, source_node_id: int) -> None:
+class DataSet(IDataSet):
+    def __init__(self, quokka_context: QuokkaContext, schema: dict, source_node_id: NodeId) -> None:
         self.quokka_context = quokka_context
         self.schema = schema
         self.source_node_id = source_node_id

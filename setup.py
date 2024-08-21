@@ -32,7 +32,7 @@ setup(
             'ray[default]>=2.7.1',
             'psutil',
             'polars==0.16.17', # latest version of Polars generally
-            'sqlglot>=11',
+            'sqlglot==11',
             'graphviz==0.20.1',
             'tqdm',
             'aiohttp',

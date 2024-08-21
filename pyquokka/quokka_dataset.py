@@ -4,22 +4,24 @@ import polars
 import pandas as pd
 import pyarrow as pa
 
-class Dataset:
+from pyquokka.types import IDataset, IDatasetManager, Schema
 
-    def __init__(self, schema, wrapped_dataset, dataset_id) -> None:
+class Dataset(IDataset):
+
+    def __init__(self, schema: Schema, wrapped_dataset: IDatasetManager, dataset_id) -> None:
         self.schema = schema
         self.wrapped_dataset = wrapped_dataset
         self.dataset_id = dataset_id
-        
+
     def __str__(self):
         return "DataSet[" + ",".join(self.schema) + "]"
 
     def __repr__(self):
         return "DataSet[" + ",".join(self.schema) + "]"
-    
+
     def __copy__(self):
         return Dataset(self.schema, self.wrapped_dataset, self.dataset_id)
-    
+
     def __deepcopy__(self, memo):
         return Dataset(self.schema, self.wrapped_dataset, self.dataset_id)
 
@@ -27,16 +29,16 @@ class Dataset:
 
         """
         This is a blocking call. It will collect all the data from the cluster and return a Polars DataFrame to the calling Python session (could be your local machine, be careful of OOM!).
-        
+
         Return:
             Polars DataFrame
         """
 
         return ray.get(self.wrapped_dataset.to_df.remote(self.dataset_id))
-    
+
     def to_dict(self):
         return  ray.get(self.wrapped_dataset.to_dict.remote(self.dataset_id))
-    
+
     def to_arrow_refs(self):
 
         """
@@ -46,7 +48,7 @@ class Dataset:
             List of Ray ObjectRefs to Arrow Tables
         """
         return ray.get(self.wrapped_dataset.to_arrow_refs.remote(self.dataset_id))
-    
+
     def to_ray_dataset(self):
 
         """
@@ -64,14 +66,14 @@ class Dataset:
 # not a big problem right now since Arrow Datasets are not fault tolerant anyway
 
 @ray.remote
-class ArrowDataset:
+class ArrowDataset(IDatasetManager):
 
     def __init__(self) -> None:
         self.latest_dataset = 0
         self.objects = {}
         self.done = {}
         self.length = {}
-    
+
     def length(self, dataset):
         return self.length[dataset]
 
@@ -113,6 +115,6 @@ class ArrowDataset:
             return polars.from_arrow(arrow_table)
         else:
             return None
-    
+
     def ping(self):
         return True

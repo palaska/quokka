@@ -1,3 +1,4 @@
+from typing import Any, Dict, Optional
 import pyarrow
 import duckdb
 import ray
@@ -9,21 +10,23 @@ from pyquokka.sql_utils import filters_to_expression
 import pyarrow.parquet as pq
 import boto3
 
+from pyquokka.types import CatalogTableId, ICatalog
+
 @ray.remote
-class Catalog:
+class Catalog(ICatalog):
     def __init__(self) -> None:
-        self.table_id = 0
-        self.samples = {}
+        self.table_id: CatalogTableId = 0
+        self.samples: Dict[CatalogTableId, pyarrow.Table] = {}
         self.ratio = {}
         self.con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
-    
-    def register_table_data_and_return_ticket(self, sample, ratio):
+
+    def register_table_data_and_return_ticket(self, sample: pyarrow.Table, ratio) -> CatalogTableId:
         assert type(sample) == pyarrow.Table
         self.samples[self.table_id] = sample
         self.ratio[self.table_id] = ratio
         self.table_id += 1
         return self.table_id - 1
-    
+
     def register_s3_csv_source(self, bucket, key, schema, sep, total_size):
 
         import numpy as np
@@ -31,7 +34,7 @@ class Catalog:
         s3 = boto3.client('s3')
         response = s3.head_object(Bucket= bucket, Key=key)
         size = response['ContentLength']
-        
+
         start_pos = np.random.randint(0, max(size - 10 * 1024 * 1024,1))
         sample = s3.get_object(Bucket=bucket, Key=key, Range='bytes={}-{}'.format(start_pos, min(start_pos + 10 * 1024 * 1024, size - 1)))['Body'].read()
         first_new_line = sample.find(b'\n')
@@ -51,7 +54,7 @@ class Catalog:
             assert os.path.isdir(filename), "Does not support prefix, must give absolute directory path for a list of files, will read everything in there!"
             files = [filename + "/" + file for file in os.listdir(filename)]
             sizes = [os.path.getsize(file) for file in files]
-        
+
         # let's now sample from one file. This can change in the future
         # we will sample 10 MB from the file
 
@@ -65,22 +68,22 @@ class Catalog:
         sample = sample[first_new_line + 1 : last_new_line]
         sample = polars.read_csv(sample, new_columns = schema, separator = sep, has_header = False).to_arrow()
         return self.register_table_data_and_return_ticket(sample, ratio = sum(sizes) / (last_new_line - first_new_line))
-    
+
     def register_s3_parquet_source(self, filepath, total_files):
         s3fs = S3FileSystem()
         dataset = pq.ParquetDataset(filepath, filesystem=s3fs )
         # very cursory estimate
         sample = dataset.fragments[0].to_table()
         return self.register_table_data_and_return_ticket(sample, ratio = total_files)
-    
+
     def register_disk_parquet_source(self, filepath):
         dataset = pq.ParquetDataset(filepath)
         sample = dataset.fragments[0].to_table() # this very likely will be the entire thing haha
         return self.register_table_data_and_return_ticket(sample, ratio = len(dataset.fragments))
 
 
-    def estimate_cardinality(self, table_id, predicate, filters_list = None):
-        
+    def estimate_cardinality(self, table_id: CatalogTableId, predicate: sqlglot.exp.Expression, filters_list: Optional[Any] = None) -> float:
+
         assert issubclass(type(predicate) , sqlglot.exp.Expression)
         # print(filters_list)
         sample = self.samples[table_id]
@@ -93,7 +96,6 @@ class Catalog:
             sql_statement = "select count(*) from sample where " + predicate.sql(dialect = "duckdb")
             con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
             count = con.execute(sql_statement).fetchall()[0][0]
-        
+
         estimated_cardinality = count * self.ratio[table_id]
         return estimated_cardinality
-        

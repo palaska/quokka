@@ -5,25 +5,25 @@ import time
 from pyquokka.dataset import InputRayDataset
 from pyquokka.coordinator import Coordinator
 from pyquokka.placement_strategy import *
-from pyquokka.quokka_dataset import * 
-from pyquokka.placement_strategy import * 
-from pyquokka.target_info import * 
+from pyquokka.quokka_dataset import *
+from pyquokka.placement_strategy import *
+from pyquokka.target_info import *
 from pyquokka.core import *
-from pyquokka.tables import * 
+from pyquokka.tables import *
+from pyquokka.types import IQuokkaContext, NodeType, TaskGraphNodeId, TaskGraphNodeType
 from pyquokka.utils import LocalCluster, EC2Cluster
 import pyquokka.sql_utils as sql_utils
 from functools import partial
 import ray.cloudpickle as pickle
 
 class TaskGraph:
-    # this keeps the logical dependency DAG between tasks 
-    def __init__(self, context) -> None:
-        
+    # this keeps the logical dependency DAG between tasks
+    def __init__(self, context: IQuokkaContext) -> None:
+
         self.context = context
-        self.current_actor = 0
-        self.actors = {}
+        self.current_actor: TaskGraphNodeId = 0
         self.actor_placement_strategy = {}
-        
+
         self.r = redis.Redis(host=str(self.context.cluster.leader_public_ip), port=6800, db=0)
         while True:
             try:
@@ -31,11 +31,11 @@ class TaskGraph:
                 break
             except:
                 time.sleep(0.01)
-        
+
         self.r.flushall()
 
         # for topological ordering
-        self.actor_types = {}
+        self.actor_types: Dict[TaskGraphNodeId, TaskGraphNodeType] = {}
 
         self.FOT = FunctionObjectTable()
         self.CLT = ChannelLocationTable()
@@ -51,7 +51,7 @@ class TaskGraph:
         # progress tracking stuff
         self.input_partitions = {}
 
-    def get_total_channels_from_placement_strategy(self, placement_strategy, node_type):
+    def get_total_channels_from_placement_strategy(self, placement_strategy: PlacementStrategy, node_type: NodeType):
 
         if type(placement_strategy) == SingleChannelStrategy:
             return 1
@@ -77,7 +77,7 @@ class TaskGraph:
         self.actor_types[self.current_actor] = 'input'
 
         # this will be a dictionary of ip addresses to ray refs
-        objects_dict = dataset.to_dict()        
+        objects_dict = dataset.to_dict()
         # print(channel_info)
         self.input_partitions[self.current_actor] = sum([len(objects_dict[k]) for k in objects_dict])
 
@@ -109,7 +109,7 @@ class TaskGraph:
                 self.NTT.rpush(pipe, node, input_task.reduce())
                 channel_locs[count] = node
                 count += 1
-        
+
         pipe.execute()
         ray.get(self.context.coordinator.register_actor_location.remote(self.current_actor, channel_locs))
 
@@ -121,9 +121,9 @@ class TaskGraph:
         self.actor_types[self.current_actor] = 'input'
         if placement_strategy is None:
             placement_strategy = CustomChannelsStrategy(1)
-        
+
         assert type(placement_strategy) in [SingleChannelStrategy, CustomChannelsStrategy, TaggedCustomChannelsStrategy]
-        
+
         channel_info = reader.get_own_state(self.get_total_channels_from_placement_strategy(placement_strategy, 'input'))
         # print(channel_info)
         self.input_partitions[self.current_actor] = sum([len(channel_info[k]) for k in channel_info])
@@ -145,9 +145,9 @@ class TaskGraph:
             self.LT.mset(pipe, vals)
             self.NTT.rpush(pipe, node, input_task.reduce())
             channel_locs[count] = node
-        
+
         elif type(placement_strategy) == CustomChannelsStrategy or type(placement_strategy) == TaggedCustomChannelsStrategy:
-        
+
             nodes = sorted(self.context.io_nodes) if type(placement_strategy) == CustomChannelsStrategy else sorted(self.context.tag_io_nodes[placement_strategy.tag])
 
             for node in nodes:
@@ -164,7 +164,7 @@ class TaskGraph:
                         self.LIT.set(pipe, pickle.dumps((self.current_actor,count)), len(lineages) - 1)
                         self.LT.mset(pipe, vals)
                         self.NTT.rpush(pipe, node, input_task.reduce())
-                    
+
                     else:
                         # this channel doesn't have anything to do, mark it as done. DST for it must be set for the executors to terminate
                         self.DST.set(pipe, pickle.dumps((self.current_actor, count)), -1)
@@ -175,10 +175,10 @@ class TaskGraph:
         ray.get(self.context.coordinator.register_actor_location.remote(self.current_actor, channel_locs))
 
         return self.epilogue(stage, placement_strategy)
-    
+
     def get_default_partition(self, source_node_id, target_placement_strategy):
         # this can get more sophisticated in the future. For now it's super dumb.
-        
+
         def partition_key_0(ratio, data, source_channel, num_target_channels):
             target_channel = source_channel // ratio
             return {target_channel: data}
@@ -188,7 +188,7 @@ class TaskGraph:
             return {target_channel: data}
 
         source_placement_strategy = self.actor_placement_strategy[source_node_id]
-        
+
 
         if type(source_placement_strategy) == CustomChannelsStrategy or type(source_placement_strategy) == TaggedCustomChannelsStrategy:
             source_total_channels = self.get_total_channels_from_placement_strategy(source_placement_strategy, self.actor_types[source_node_id])
@@ -205,7 +205,7 @@ class TaskGraph:
             target_total_channels = 1
         else:
             raise Exception("target strategy not supported")
-        
+
         if source_total_channels >= target_total_channels:
             return partial(partition_key_0, source_total_channels // target_total_channels )
         else:
@@ -227,9 +227,9 @@ class TaskGraph:
                 raise Exception("partition key type not supported")
             for partition in partitions:
                 target = partition["__partition__"][0]
-                result[target] = partition.drop("__partition__")   
+                result[target] = partition.drop("__partition__")
             return result
-        
+
 
         def partition_key_range(key, total_range, data, source_channel, num_target_channels):
 
@@ -239,13 +239,13 @@ class TaskGraph:
             partitions = data.with_columns(polars.Series(name="__partition__", values=((data[key] - 1) // per_channel_range))).partition_by("__partition__")
             for partition in partitions:
                 target = partition["__partition__"][0]
-                result[target] = partition.drop("__partition__")   
-            return result 
+                result[target] = partition.drop("__partition__")
+            return result
 
         def broadcast(data, source_channel, num_target_channels):
             return {i: data for i in range(num_target_channels)}
-        
-        
+
+
         mapping = {}
         sources = []
 
@@ -255,7 +255,7 @@ class TaskGraph:
             sources.append(source)
             mapping[source] = key
 
-            target_info = source_target_info[key] 
+            target_info = source_target_info[key]
             target_info.projection = target_info.projection
 
             # this has been provided
@@ -271,13 +271,13 @@ class TaskGraph:
                 target_info.partitioner = self.get_default_partition(source, placement_strategy)
             else:
                 raise Exception("Partitioner not supported")
-            
+
             target_info.lowered = True
             self.PFT.set(self.r, pickle.dumps((source, self.current_actor)), ray.cloudpickle.dumps(target_info))
 
             # TODO: figure out why you need to do this to make it work
             self.PFT.get(self.r, pickle.dumps((source, self.current_actor)))
-        
+
         registered = ray.get([node.register_partition_function.remote(sources, self.current_actor, self.get_total_channels_from_placement_strategy(placement_strategy, 'exec'), mapping) for node in (self.context.task_managers.values())])
         assert all(registered)
 
@@ -302,10 +302,14 @@ class TaskGraph:
             source_actor_ids = []
             source_channel_ids = []
             min_seqs = []
+            # @palaska: each source here is an actor id that belongs to the stage {stage}
             for source in stage_sources[stage]:
                 num_channels = self.get_total_channels_from_placement_strategy(self.actor_placement_strategy[source], self.actor_types[source])
+                # @palaska: for 4 channels, [5, 5, 5, 5] (actor id is 5), we extend this list for every actor
                 source_actor_ids.extend([source] * num_channels)
+                # @palaska: for 4 channels, [0, 1, 2, 3], we extend this list for every actor
                 source_channel_ids.extend(range(num_channels))
+                # @palaska: for 4 channels, [0, 0, 0, 0], we extend this list for every actor
                 min_seqs.extend([0] * num_channels)
             input_reqs.append(polars.from_dict({"source_actor_id":source_actor_ids, "source_channel_id":source_channel_ids, "min_seq":min_seqs}))
 
@@ -319,7 +323,7 @@ class TaskGraph:
 
         if placement_strategy is None:
             placement_strategy = CustomChannelsStrategy(1)
-        
+
         pipe = self.r.pipeline()
 
         self.FOT.set(pipe, self.current_actor, ray.cloudpickle.dumps(functionObject))
@@ -332,7 +336,7 @@ class TaskGraph:
             # first find how many channels that key has in input_reqs
             sorted_source_channels = len(polars.concat(input_reqs).filter(polars.col("source_actor_id") == key))
             assume_sorted[key] = sorted_source_channels
-        
+
         if len(assume_sorted) > 0:
             self.SAT.set(pipe, self.current_actor, pickle.dumps(assume_sorted))
 
@@ -361,7 +365,7 @@ class TaskGraph:
 
         else:
             raise Exception("placement strategy not supported")
-        
+
         pipe.execute()
         ray.get(self.context.coordinator.register_actor_location.remote(self.current_actor, channel_locs))
 
@@ -379,23 +383,23 @@ class TaskGraph:
         registered = ray.get([node.register_blocking.remote(current_actor , transform_fn, self.context.dataset_manager, dataset_id) for node in list(self.context.task_managers.values())])
         assert all(registered)
         return dataset_id
-    
+
     def create(self):
 
         initted = ray.get([node.init.remote() for node in list(self.context.task_managers.values())])
         assert all(initted)
 
-        # galaxy brain shit here -- the topological order is implicit given the way the API works. 
+        # galaxy brain shit here -- the topological order is implicit given the way the API works.
         topological_order = list(range(self.current_actor))[::-1]
         topological_order = [k for k in topological_order if self.actor_types[k] != 'input']
         # print("topological_order", topological_order)
         ray.get(self.context.coordinator.register_actor_topo.remote(topological_order))
-        
+
     def run(self):
 
         from tqdm import tqdm
 
-        execute_handle = self.context.coordinator.execute.remote()          
+        execute_handle = self.context.coordinator.execute.remote()
 
         input_partitions = {}
         pbars = {k: tqdm(total = self.input_partitions[k]) for k in self.input_partitions}
