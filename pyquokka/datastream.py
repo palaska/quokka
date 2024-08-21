@@ -1,11 +1,18 @@
-from typing import Callable, Iterable, Set
+from typing import Callable, Iterable, Set, cast
 from pyquokka.executors import *
 from pyquokka.dataset import *
 from pyquokka.logical import *
 from pyquokka.target_info import *
 from pyquokka.quokka_runtime import *
 from pyquokka.expression import *
-from pyquokka.types import ColumnName, ExplainMode, IDataStream, IQuokkaContext, NodeId, Schema
+from pyquokka.types import (
+    ColumnName,
+    ExplainMode,
+    IDataStream,
+    IQuokkaContext,
+    NodeId,
+    Schema,
+)
 from pyquokka.utils import EC2Cluster, LocalCluster
 from pyquokka.sql_utils import required_columns_from_exp, label_sample_table_names
 from functools import partial
@@ -14,8 +21,8 @@ from sqlglot.dataframe.sql import functions as F
 from threadpoolctl import threadpool_limits
 import numpy as np
 
-class DataStream(IDataStream):
 
+class DataStream(IDataStream):
     """
     Quokka DataStream class is how most users are expected to interact with Quokka.
     However users are not expected to create a DataStream directly by calling its constructor.
@@ -36,23 +43,31 @@ class DataStream(IDataStream):
 
     """
 
-    def __init__(self, quokka_context: IQuokkaContext, schema: Schema, source_node_id: NodeId, sorted_reqs = None, materialized = False) -> None:
+    def __init__(
+        self,
+        quokka_context: IQuokkaContext,
+        schema: Schema,
+        source_node_id: NodeId,
+        sorted_reqs=None,
+        materialized=False,
+    ) -> None:
         self.quokka_context = quokka_context
         self.schema = schema
         self.source_node_id = source_node_id
         self.sorted = None
         if sorted_reqs is not None:
             self._set_sorted(sorted_reqs)
-        self.materialized = materialized # this is used to indicate whether or not the source is materializable from a polars dataframe
+        # this is used to indicate whether or not the source is materializable from a polars dataframe
+        self.materialized = materialized
 
-    def _get_materialized_df(self):
+    def _get_materialized_df(self) -> polars.DataFrame:
         assert self.materialized == True
-        return self.quokka_context.nodes[self.source_node_id].df
+        return cast(InputPolarsNode, self.quokka_context.nodes[self.source_node_id]).df
 
     def _set_materialized_df(self, df):
         assert type(df) == polars.DataFrame
         assert self.materialized == True
-        self.quokka_context.nodes[self.source_node_id].df = df
+        cast(InputPolarsNode, self.quokka_context.nodes[self.source_node_id]).df = df
         self.schema = df.columns
 
     def _set_sorted(self, sorted_reqs):
@@ -61,7 +76,9 @@ class DataStream(IDataStream):
         Use with care! If the thing isn't actually sorted, shit will blow up.
         """
         assert type(sorted_reqs) == dict
-        self.quokka_context.nodes[self.source_node_id].set_output_sorted_reqs(sorted_reqs)
+        self.quokka_context.nodes[self.source_node_id].set_output_sorted_reqs(
+            sorted_reqs
+        )
         self.sorted = sorted_reqs
 
     def __str__(self):
@@ -71,7 +88,9 @@ class DataStream(IDataStream):
         return "DataStream[" + ",".join(self.schema) + "]"
 
     def __getitem__(self, key):
-        assert key in self.schema, "Column " + key + " not in schema " + str(self.schema)
+        assert key in self.schema, (
+            "Column " + key + " not in schema " + str(self.schema)
+        )
         return Expression(F.col(key))
 
     def collect(self) -> polars.DataFrame | polars.Series:
@@ -118,15 +137,17 @@ class DataStream(IDataStream):
         return self.quokka_context.execute_node(dataset.source_node_id, collect=False)
 
     def explain(self, mode: ExplainMode = "graph") -> None:
-        '''
+        """
         This will not trigger the execution of your computation graph but will produce a graph of the execution plan.
         Args:
             mode (str): 'graph' will show a graph, 'text' will print a textual description.
         Return:
             None.
-        '''
+        """
         dataset = self.quokka_context.new_dataset(self, self.schema)
-        return self.quokka_context.execute_node(dataset.source_node_id, explain=True, mode=mode)
+        return self.quokka_context.execute_node(
+            dataset.source_node_id, explain=True, mode=mode
+        )
 
     def write_csv(self, table_location, output_line_limit=1000000):
         """
@@ -163,7 +184,8 @@ class DataStream(IDataStream):
 
             if type(self.quokka_context.cluster) == LocalCluster:
                 print(
-                    "Warning: trying to write S3 dataset on local machine. This assumes high network bandwidth.")
+                    "Warning: trying to write S3 dataset on local machine. This assumes high network bandwidth."
+                )
 
             table_location = table_location[5:]
             bucket = table_location.split("/")[0]
@@ -173,20 +195,24 @@ class DataStream(IDataStream):
             except:
                 raise Exception("Bucket does not exist.")
             executor = OutputExecutor(
-                table_location, "csv", region=region, row_group_size=output_line_limit)
+                table_location, "csv", region=region, row_group_size=output_line_limit
+            )
 
         else:
 
             if type(self.quokka_context.cluster) == EC2Cluster:
                 raise NotImplementedError(
-                    "Does not support wQuokkariting local dataset with S3 cluster. Must use S3 bucket.")
+                    "Does not support wQuokkariting local dataset with S3 cluster. Must use S3 bucket."
+                )
 
-            assert table_location[0] == "/", "You must supply absolute path to directory."
-            assert os.path.isdir(
-                table_location), "Must supply an existing directory"
+            assert (
+                table_location[0] == "/"
+            ), "You must supply absolute path to directory."
+            assert os.path.isdir(table_location), "Must supply an existing directory"
 
             executor = OutputExecutor(
-                table_location, "csv", region="local", row_group_size=output_line_limit)
+                table_location, "csv", region="local", row_group_size=output_line_limit
+            )
 
         name_stream = self.quokka_context.new_stream(
             sources={0: self},
@@ -196,16 +222,14 @@ class DataStream(IDataStream):
                 # this is a stateful node, but predicates and projections can be pushed down.
                 schema_mapping={"filename": {-1: "filename"}},
                 required_columns={0: set(self.schema)},
-                operator=executor
+                operator=executor,
             ),
             schema=["filename"],
-
         )
 
         return name_stream
 
     def write_parquet(self, table_location, output_line_limit=5000000):
-
         """
         This will write out the entire contents of the DataStream to a list of Parquets.
 
@@ -238,7 +262,8 @@ class DataStream(IDataStream):
 
             if type(self.quokka_context.cluster) == LocalCluster:
                 print(
-                    "Warning: trying to write S3 dataset on local machine. This assumes high network bandwidth.")
+                    "Warning: trying to write S3 dataset on local machine. This assumes high network bandwidth."
+                )
 
             table_location = table_location[5:]
             bucket = table_location.split("/")[0]
@@ -248,18 +273,29 @@ class DataStream(IDataStream):
             except:
                 raise Exception("Bucket does not exist.")
             executor = OutputExecutor(
-                table_location, "parquet", region=region, row_group_size=output_line_limit)
+                table_location,
+                "parquet",
+                region=region,
+                row_group_size=output_line_limit,
+            )
 
         else:
 
             if type(self.quokka_context.cluster) == EC2Cluster:
                 raise NotImplementedError(
-                    "Does not support writing local dataset with S3 cluster. Must use S3 bucket.")
+                    "Does not support writing local dataset with S3 cluster. Must use S3 bucket."
+                )
 
-            assert table_location[0] == "/", "You must supply absolute path to directory."
+            assert (
+                table_location[0] == "/"
+            ), "You must supply absolute path to directory."
 
             executor = OutputExecutor(
-                table_location, "parquet", region="local", row_group_size=output_line_limit)
+                table_location,
+                "parquet",
+                region="local",
+                row_group_size=output_line_limit,
+            )
 
         name_stream = self.quokka_context.new_stream(
             sources={0: self},
@@ -269,16 +305,14 @@ class DataStream(IDataStream):
                 # this is a stateful node, but predicates and projections can be pushed down.
                 schema_mapping={"filename": {-1: "filename"}},
                 required_columns={0: set(self.schema)},
-                operator=executor
+                operator=executor,
             ),
             schema=["filename"],
-
         )
 
         return name_stream
 
     def filter(self, predicate: Expression):
-
         """
         This will filter the DataStream to contain only rows that match a certain predicate specified in SQL syntax.
         You can write any SQL clause you would generally put in a WHERE statement containing arbitrary conjunctions and
@@ -321,8 +355,7 @@ class DataStream(IDataStream):
         assert type(predicate) == Expression, "Must supply an Expression."
         return self.filter_sql(predicate.sql())
 
-    def filter_sql(self, predicate: str) -> 'DataStream':
-
+    def filter_sql(self, predicate: str) -> "DataStream":
         """
         This will filter the DataStream to contain only rows that match a certain predicate specified in SQL syntax.
         You can write any SQL clause you would generally put in a WHERE statement containing arbitrary conjunctions and
@@ -369,34 +402,62 @@ class DataStream(IDataStream):
         assert type(predicate) == str
         predicate = sqlglot.parse_one(predicate)
         # convert to CNF
-        predicate = optimizer.normalize.normalize(predicate, dnf = False)
+        predicate = optimizer.normalize.normalize(predicate, dnf=False)
 
-        columns = set(i.name for i in predicate.find_all(
-            sqlglot.expressions.Column))
+        columns = set(i.name for i in predicate.find_all(sqlglot.expressions.Column))
         for column in columns:
-            assert column in self.schema, "Tried to filter on a column not in the schema {}".format(column)
+            assert (
+                column in self.schema
+            ), "Tried to filter on a column not in the schema {}".format(column)
 
         if self.materialized:
             batch_arrow = self._get_materialized_df().to_arrow()
-            con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
-            df: polars.DataFrame | polars.Series = polars.from_arrow(con.execute("select * from batch_arrow where " + predicate.sql(dialect = "duckdb")).arrow())
+            con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
+            df: polars.DataFrame | polars.Series = polars.from_arrow(
+                con.execute(
+                    "select * from batch_arrow where " + predicate.sql(dialect="duckdb")
+                ).arrow()
+            )
             return self.quokka_context.from_polars(df)
 
         if not optimizer.normalize.normalized(predicate):
-            def f(df: polars.DataFrame | polars.Series) -> polars.DataFrame | polars.Series:
-                batch_arrow = df.to_arrow()
-                con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
-                return polars.from_arrow(con.execute("select * from batch_arrow where " + predicate.sql(dialect = "duckdb")).arrow())
 
-            transformed = self.transform(f, new_schema = self.schema, required_columns=self.schema)
+            def f(
+                df: polars.DataFrame | polars.Series,
+            ) -> polars.DataFrame | polars.Series:
+                batch_arrow = df.to_arrow()
+                con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
+                return polars.from_arrow(
+                    con.execute(
+                        "select * from batch_arrow where "
+                        + predicate.sql(dialect="duckdb")
+                    ).arrow()
+                )
+
+            transformed = self.transform(
+                f, new_schema=self.schema, required_columns=self.schema
+            )
             return transformed
         else:
-            return self.quokka_context.new_stream(sources={0: self}, partitioners={0: PassThroughPartitioner()}, node=FilterNode(self.schema, predicate),
-                                              schema=self.schema, sorted = self.sorted)
+            return self.quokka_context.new_stream(
+                sources={0: self},
+                partitioners={0: PassThroughPartitioner()},
+                node=FilterNode(self.schema, predicate),
+                schema=self.schema,
+                sorted=self.sorted,
+            )
 
-
-    def vector_nn_join(self, probe_df, vec_column = None, vec_column_left = None, vec_column_right = None, k = 1, suffix = "_probe", probe_side = "right", tmp_directory = None):
-
+    def vector_nn_join(
+        self,
+        probe_df,
+        vec_column=None,
+        vec_column_left=None,
+        vec_column_right=None,
+        k=1,
+        suffix="_probe",
+        probe_side="right",
+        tmp_directory=None,
+    ):
         """
         Probe a Quokka DataStream with a vector column by a Polars DataFrame with a vector column.
         For each vector in the Polars DataFrame it will find the k nearest neighbors in the vector column of the Quokka DataStream.
@@ -415,11 +476,15 @@ class DataStream(IDataStream):
         """
 
         if vec_column is not None:
-            assert vec_column_left is None and vec_column_right is None, "cannot specify both vec_column and vec_column_left/vec_column_right"
+            assert (
+                vec_column_left is None and vec_column_right is None
+            ), "cannot specify both vec_column and vec_column_left/vec_column_right"
             vec_column_left = vec_column
             vec_column_right = vec_column
         else:
-            assert vec_column_right is not None and vec_column_left is not None, "must specify either vec_column or vec_column_left/vec_column_right"
+            assert (
+                vec_column_right is not None and vec_column_left is not None
+            ), "must specify either vec_column or vec_column_left/vec_column_right"
 
         assert k >= 1, "k must be at least 1"
         assert type(probe_df) == polars.DataFrame, "probe_df must be a polars DataFrame"
@@ -427,9 +492,14 @@ class DataStream(IDataStream):
         assert vec_column_left in self.schema, "Vector column not in schema"
         assert vec_column_right in probe_df.schema, "Probe column not in schema"
 
-        assert probe_side in ["left", "right"], "probe_side must be either 'left' or 'right'"
+        assert probe_side in [
+            "left",
+            "right",
+        ], "probe_side must be either 'left' or 'right'"
         if probe_side == "left":
-            assert tmp_directory is not None, "tmp_directory must be specified if probe_side is 'left'"
+            assert (
+                tmp_directory is not None
+            ), "tmp_directory must be specified if probe_side is 'left'"
 
         # rename any column in probe_df that is also in self.schema
 
@@ -438,7 +508,9 @@ class DataStream(IDataStream):
         schema_mapping = {col: {0: col} for col in self.schema}
         for col_name in probe_df.columns:
             if col_name in self.schema:
-                assert col_name + suffix not in probe_df.columns, "suffix not sufficient to avoid column name collision"
+                assert (
+                    col_name + suffix not in probe_df.columns
+                ), "suffix not sufficient to avoid column name collision"
                 probe_df = probe_df.rename({col_name: col_name + suffix})
                 if col_name == vec_column_right:
                     probe_vec_col = col_name + suffix
@@ -449,53 +521,92 @@ class DataStream(IDataStream):
                 schema_mapping[col_name] = {-1: col_name}
 
         if probe_side == "right":
-            node = NearestNeighborFilterNode(new_schema, schema_mapping, vec_column_left, probe_df, probe_vec_col,  k)
+            node = NearestNeighborFilterNode(
+                new_schema, schema_mapping, vec_column_left, probe_df, probe_vec_col, k
+            )
 
-            return self.quokka_context.new_stream(sources={0: self}, partitioners={0: PassThroughPartitioner()}, node=node,
-                                                schema=new_schema, sorted = self.sorted)
+            return self.quokka_context.new_stream(
+                sources={0: self},
+                partitioners={0: PassThroughPartitioner()},
+                node=node,
+                schema=new_schema,
+                sorted=self.sorted,
+            )
         else:
             # you are probing a small polars dataframe with a datastream, this will typically make the datastream bigger.
             # so don't push down, can't push down into lance anyway.
             import lance
+
             class ProbeExecutor(Executor):
                 def __init__(self) -> None:
                     try:
-                        self.dataset = lance.write_dataset(probe_df.to_arrow(), tmp_directory)
-                        self.dataset.create_index(vec_column_right, index_type = "IVF_PQ", num_partitions=256, num_sub_vectors=16)
+                        self.dataset = lance.write_dataset(
+                            probe_df.to_arrow(), tmp_directory
+                        )
+                        self.dataset.create_index(
+                            vec_column_right,
+                            index_type="IVF_PQ",
+                            num_partitions=256,
+                            num_sub_vectors=16,
+                        )
                     except:
-                        raise Exception("Failed to write dataset to tmp directory, is it writeable?")
-                def execute(self,batches,stream_id, executor_id):
+                        raise Exception(
+                            "Failed to write dataset to tmp directory, is it writeable?"
+                        )
+
+                def execute(self, batches, stream_id, executor_id):
                     batch = pa.concat_tables(batches)
                     probe_vecs = batch.column(probe_vec_col).to_numpy()
-                    results = pa.concat_tables([self.dataset.to_table(nearest={"column": vec_column_right, "k": k, "q": probe_vecs[i]})
-                                                 for i in range(len(probe_vecs))])
-                    return pa.Table.from_arrays(batch.columns + results.columns, names=batch.column_names + results.column_names)
-                def done(self,executor_id):
+                    results = pa.concat_tables(
+                        [
+                            self.dataset.to_table(
+                                nearest={
+                                    "column": vec_column_right,
+                                    "k": k,
+                                    "q": probe_vecs[i],
+                                }
+                            )
+                            for i in range(len(probe_vecs))
+                        ]
+                    )
+                    return pa.Table.from_arrays(
+                        batch.columns + results.columns,
+                        names=batch.column_names + results.column_names,
+                    )
+
+                def done(self, executor_id):
                     return
 
             executor = ProbeExecutor()
-            return self.stateful_transform(executor, new_schema = new_schema, required_columns = set(vec_column_left),
-                                           partitioner = PassThroughPartitioner(), placement_strategy= CustomChannelsStrategy(1))
+            return self.stateful_transform(
+                executor,
+                new_schema=new_schema,
+                required_columns=set(vec_column_left),
+                partitioner=PassThroughPartitioner(),
+                placement_strategy=CustomChannelsStrategy(1),
+            )
 
-
-
-    def vector_range_join(self, vec_column = None, vec_column_left = None, vec_column_right = None, probe_side = "left", k = 1):
-
+    def vector_range_join(
+        self,
+        vec_column=None,
+        vec_column_left=None,
+        vec_column_right=None,
+        probe_side="left",
+        k=1,
+    ):
         """
         This will perform a nearest neighbor join between two Quokka DataStreams.
         The plan is to convert this to a NearestNeighborFilterNode after you propagate cardinality and figure out which side is smaller.
 
         """
 
-        pass # we need to eventually compile this down to some kind of filter
+        pass  # we need to eventually compile this down to some kind of filter
         # node = NearestNeighborFilterNode(new_schema, vec_column, query_vectors,  k, probe_vector_col)
 
         # return self.quokka_context.new_stream(sources={0: self}, partitioners={0: PassThroughPartitioner()}, node=node,
         #                                       schema=new_schema, sorted = self.sorted)
 
-
     def select(self, columns: list):
-
         """
         This will create a new DataStream that contains only selected columns from the source DataStream.
 
@@ -541,11 +652,10 @@ class DataStream(IDataStream):
             partitioners={0: PassThroughPartitioner()},
             node=ProjectionNode(set(columns)),
             schema=columns,
-            sorted = self.sorted
-            )
+            sorted=self.sorted,
+        )
 
     def drop(self, cols_to_drop: list):
-
         """
         Think of this as the anti-opereator to select. Instead of selecting columns, this will drop columns.
         This is implemented in Quokka as selecting the columns in the DataStream's schema that are not dropped.
@@ -581,10 +691,11 @@ class DataStream(IDataStream):
                 df = self._get_materialized_df().drop(actual_cols_to_drop)
                 return self.quokka_context.from_polars(df)
             else:
-                return self.select([col for col in self.schema if col not in cols_to_drop])
+                return self.select(
+                    [col for col in self.schema if col not in cols_to_drop]
+                )
 
     def rename(self, rename_dict):
-
         """
         Renames columns in the DataStream according to rename_dict. This is similar to
         [`polars.rename`](https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.DataFrame.rename.html).
@@ -612,11 +723,12 @@ class DataStream(IDataStream):
         """
 
         new_sorted = {}
-        assert type(
-            rename_dict) == dict, "must specify a dictionary like Polars"
+        assert type(rename_dict) == dict, "must specify a dictionary like Polars"
         for key in rename_dict:
             assert key in self.schema, "key in rename dict must be in schema"
-            assert rename_dict[key] not in self.schema, "new name must not be in current schema"
+            assert (
+                rename_dict[key] not in self.schema
+            ), "new name must not be in current schema"
             if self.sorted is not None and key in self.sorted:
                 new_sorted[rename_dict[key]] = self.sorted[key]
 
@@ -625,8 +737,9 @@ class DataStream(IDataStream):
             return self.quokka_context.from_polars(df)
 
         # the fact you can write this in one line is why I love Python
-        new_schema = [col if col not in rename_dict else rename_dict[col]
-                      for col in self.schema]
+        new_schema = [
+            col if col not in rename_dict else rename_dict[col] for col in self.schema
+        ]
         schema_mapping = {}
         for key in rename_dict:
             schema_mapping[rename_dict[key]] = {0: key}
@@ -634,7 +747,8 @@ class DataStream(IDataStream):
             if key not in rename_dict:
                 schema_mapping[key] = {0: key}
 
-        def f(x): return x.rename(rename_dict)
+        def f(x):
+            return x.rename(rename_dict)
 
         return self.quokka_context.new_stream(
             sources={0: self},
@@ -644,15 +758,21 @@ class DataStream(IDataStream):
                 schema_mapping=schema_mapping,
                 required_columns={0: set(rename_dict.keys())},
                 function=f,
-                foldable=True
+                foldable=True,
             ),
             schema=new_schema,
-            sorted = new_sorted if len(new_sorted) > 0 else None
-
+            sorted=new_sorted if len(new_sorted) > 0 else None,
         )
 
-    def transform(self, f: Callable[[polars.DataFrame | polars.Series], polars.DataFrame | polars.Series], new_schema: Schema, required_columns: Iterable[ColumnName], foldable: bool = True) -> 'DataStream':
-
+    def transform(
+        self,
+        f: Callable[
+            [polars.DataFrame | polars.Series], polars.DataFrame | polars.Series
+        ],
+        new_schema: Schema,
+        required_columns: Iterable[ColumnName],
+        foldable: bool = True,
+    ) -> "DataStream":
         """
         This is a rather Quokka-specific API that allows arbitrary transformations on a DataStream, similar to Spark RDD.map.
         Each batch in the DataStream is going to be transformed according to a user defined function, which can produce a new batch.
@@ -734,14 +854,12 @@ class DataStream(IDataStream):
                 schema_mapping={col: {-1: col} for col in new_schema},
                 required_columns={0: required_columns},
                 function=f,
-                foldable=foldable
+                foldable=foldable,
             ),
             schema=new_schema,
-
         )
 
-    def transform_sql(self, sql_expression, groupby = [], foldable = True):
-
+    def transform_sql(self, sql_expression, groupby=[], foldable=True):
         """
 
         This is a SQL version of the `transform` method. It allows you to write SQL expressions that can be applied to each batch in the DataStream.
@@ -766,11 +884,15 @@ class DataStream(IDataStream):
 
         assert type(groupby) == list
 
-        enhanced_exp = "select " +",".join(groupby) + ", " + sql_expression + " from batch_arrow"
+        enhanced_exp = (
+            "select " + ",".join(groupby) + ", " + sql_expression + " from batch_arrow"
+        )
         if len(groupby) > 0:
             enhanced_exp = enhanced_exp + " group by " + ",".join(groupby)
 
-        enhanced_exp = label_sample_table_names(sqlglot.parse_one(enhanced_exp), 'batch_arrow').sql()
+        enhanced_exp = label_sample_table_names(
+            sqlglot.parse_one(enhanced_exp), "batch_arrow"
+        ).sql()
 
         sqlglot_node = sqlglot.parse_one(enhanced_exp)
         required_columns = required_columns_from_exp(sqlglot_node)
@@ -782,24 +904,36 @@ class DataStream(IDataStream):
             assert col in self.schema, "required column %s not in schema" % col
 
         new_columns = [i.alias for i in sqlglot_node.selects if i.name not in groupby]
-        assert '' not in new_columns, "must provide alias for each computation"
+        assert "" not in new_columns, "must provide alias for each computation"
 
         assert type(required_columns) == set
         for column in new_columns:
-            assert column not in self.schema, "For now new columns cannot have same names as existing columns"
+            assert (
+                column not in self.schema
+            ), "For now new columns cannot have same names as existing columns"
 
         if self.materialized:
             batch_arrow = self._get_materialized_df().to_arrow()
-            con = duckdb.connect().execute('PRAGMA threads=%d' % multiprocessing.cpu_count())
+            con = duckdb.connect().execute(
+                "PRAGMA threads=%d" % multiprocessing.cpu_count()
+            )
             df = polars.from_arrow(con.execute(enhanced_exp).arrow())
             return self.quokka_context.from_polars(df)
 
         def duckdb_func(func, batch):
             batch_arrow = batch.to_arrow()
-            for i, (col_name, type_) in enumerate(zip(batch_arrow.schema.names, batch_arrow.schema.types)):
+            for i, (col_name, type_) in enumerate(
+                zip(batch_arrow.schema.names, batch_arrow.schema.types)
+            ):
                 if pa.types.is_boolean(type_):
-                    batch_arrow = batch_arrow.set_column(i, col_name, compute.cast(batch_arrow.column(col_name), pa.int32()))
-            con = duckdb.connect().execute('PRAGMA threads=%d' % multiprocessing.cpu_count())
+                    batch_arrow = batch_arrow.set_column(
+                        i,
+                        col_name,
+                        compute.cast(batch_arrow.column(col_name), pa.int32()),
+                    )
+            con = duckdb.connect().execute(
+                "PRAGMA threads=%d" % multiprocessing.cpu_count()
+            )
             return polars.from_arrow(con.execute(func).arrow())
 
         return self.quokka_context.new_stream(
@@ -808,16 +942,18 @@ class DataStream(IDataStream):
             node=MapNode(
                 schema=groupby + new_columns,
                 schema_mapping={
-                    **{new_column: {-1: new_column} for new_column in new_columns}, **{col: {0: col} for col in self.schema}},
+                    **{new_column: {-1: new_column} for new_column in new_columns},
+                    **{col: {0: col} for col in self.schema},
+                },
                 required_columns={0: required_columns},
                 function=partial(duckdb_func, enhanced_exp),
-                foldable=foldable),
-            schema= groupby + new_columns,
-            sorted = self.sorted
-            )
+                foldable=foldable,
+            ),
+            schema=groupby + new_columns,
+            sorted=self.sorted,
+        )
 
     def union(self, other):
-
         """
         The union of two streams is a stream that contains all the elements of both streams.
         The two streams must have the same schema.
@@ -843,9 +979,11 @@ class DataStream(IDataStream):
         class UnionExecutor(Executor):
             def __init__(self) -> None:
                 self.state = None
-            def execute(self,batches,stream_id, executor_id):
+
+            def execute(self, batches, stream_id, executor_id):
                 return pa.concat_tables(batches)
-            def done(self,executor_id):
+
+            def done(self, executor_id):
                 return
 
         executor = UnionExecutor()
@@ -855,7 +993,7 @@ class DataStream(IDataStream):
             # cannot push through any predicates or projections!
             schema_mapping={col: {0: col, 1: col} for col in self.schema},
             required_columns={0: set(), 1: set()},
-            operator=executor
+            operator=executor,
         )
 
         return self.quokka_context.new_stream(
@@ -863,11 +1001,10 @@ class DataStream(IDataStream):
             partitioners={0: PassThroughPartitioner(), 1: PassThroughPartitioner()},
             node=node,
             schema=self.schema,
-            sorted=None
+            sorted=None,
         )
 
     def clip(self, columns):
-
         """
         Clip the values of the specified columns to the specified min and max values.
         The min and max values can be either a single value or a list of values (one for each column).
@@ -888,7 +1025,12 @@ class DataStream(IDataStream):
         # can't use with_columns or transform because we want some columns to be passed through but not all.
 
         def polars_func(batch):
-            return batch.with_columns([polars.col(col).clip(min_, max_) for col, (min_, max_) in columns.items()])
+            return batch.with_columns(
+                [
+                    polars.col(col).clip(min_, max_)
+                    for col, (min_, max_) in columns.items()
+                ]
+            )
 
         return self.quokka_context.new_stream(
             sources={0: self},
@@ -896,16 +1038,18 @@ class DataStream(IDataStream):
             node=MapNode(
                 schema=self.schema,
                 schema_mapping={
-                    **{column: {-1: column} for column in columns}, **{col: {0: col} for col in self.schema if col not in columns}},
+                    **{column: {-1: column} for column in columns},
+                    **{col: {0: col} for col in self.schema if col not in columns},
+                },
                 required_columns={0: set(columns)},
                 function=polars_func,
-                foldable=True),
+                foldable=True,
+            ),
             schema=self.schema,
-            sorted = self.sorted
-            )
+            sorted=self.sorted,
+        )
 
-    def approximate_median(self, columns, sample_factor = 1):
-
+    def approximate_median(self, columns, sample_factor=1):
         """
         Use the t-digest algorithm to compute approximate median.
 
@@ -920,8 +1064,7 @@ class DataStream(IDataStream):
 
         return self.approximate_quantile(columns, 0.5, sample_factor)
 
-    def approximate_quantile(self, columns, quantiles, sample_factor = 1):
-
+    def approximate_quantile(self, columns, quantiles, sample_factor=1):
         """
         Use the t-digest algorithm to compute approximate quantiles.
         This operator requires [ldbpy](https://pypi.org/project/ldbpy/#description) to be installed on the cluster.
@@ -947,7 +1090,9 @@ class DataStream(IDataStream):
         class TDigestExecutor(Executor):
             def __init__(self, columns, quantiles) -> None:
                 self.columns = columns
-                assert type(quantiles) == list or type(quantiles) == float, "quantile must be a list or a float"
+                assert (
+                    type(quantiles) == list or type(quantiles) == float
+                ), "quantile must be a list or a float"
                 if type(quantiles) == float:
                     assert 0 <= quantiles <= 1, "quantile must be between 0 and 1"
                     quantiles = [quantiles]
@@ -956,17 +1101,24 @@ class DataStream(IDataStream):
                 assert 0 < sample_factor <= 1
                 self.sample_factor = sample_factor
 
-            def execute(self,batches,stream_id, executor_id):
+            def execute(self, batches, stream_id, executor_id):
                 from pyarrow.cffi import ffi
+
                 os.environ["OMP_NUM_THREADS"] = "8"
                 import time
+
                 if self.state is None:
                     import ldbpy
-                    self.state = ldbpy.NTDigest(len(self.columns), 100,500)
+
+                    self.state = ldbpy.NTDigest(len(self.columns), 100, 500)
 
                 arrow_batch = pa.concat_tables(batches)
                 if self.sample_factor < 1:
-                    indices = np.random.choice(len(arrow_batch), int(len(arrow_batch) * self.sample_factor), replace=False)
+                    indices = np.random.choice(
+                        len(arrow_batch),
+                        int(len(arrow_batch) * self.sample_factor),
+                        replace=False,
+                    )
                     arrow_batch = arrow_batch.take(pa.array(indices))
 
                 array_ptrs = []
@@ -993,29 +1145,38 @@ class DataStream(IDataStream):
                 del c_arrays
                 # print("TIME", time.time() - start)
 
-            def done(self,executor_id):
+            def done(self, executor_id):
                 dicts = []
                 for quantile in self.quantiles:
-                    values = [self.state.quantile(i, quantile) for i in range(len(self.columns))]
-                    dicts.append({col: value for col, value in zip(self.columns, values)})
+                    values = [
+                        self.state.quantile(i, quantile)
+                        for i in range(len(self.columns))
+                    ]
+                    dicts.append(
+                        {col: value for col, value in zip(self.columns, values)}
+                    )
                 return polars.from_dicts(dicts)
 
         class MeanExecutor(Executor):
             def __init__(self) -> None:
                 self.state = None
                 self.count = 0
-            def execute(self,batches,stream_id, executor_id):
+
+            def execute(self, batches, stream_id, executor_id):
                 for batch in batches:
-                    #print(batch)
+                    # print(batch)
                     self.count += 1
                     if self.state is None:
                         self.state = polars.from_arrow(batch)
                     else:
                         self.state += polars.from_arrow(batch)
-            def done(self,executor_id):
+
+            def done(self, executor_id):
                 return self.state / self.count
 
-        assert type(quantiles) == float or type(quantiles) == list, "quantiles must be a float or a list"
+        assert (
+            type(quantiles) == float or type(quantiles) == list
+        ), "quantiles must be a float or a list"
         if type(quantiles) == float:
             quantiles = [quantiles]
 
@@ -1023,17 +1184,28 @@ class DataStream(IDataStream):
             df = self._get_materialized_df()
             frames = []
             for quantile in quantiles:
-                frames.append(df.select([polars.col(col).quantile(quantile) for col in columns]))
+                frames.append(
+                    df.select([polars.col(col).quantile(quantile) for col in columns])
+                )
             return self.quokka_context.from_polars(polars.concat(frames))
 
         selected_stream = self.select(columns)
         executor = TDigestExecutor(columns, quantiles)
-        stream = selected_stream.stateful_transform( executor, columns, required_columns = set(columns), partitioner = PassThroughPartitioner())
-        return stream.stateful_transform( MeanExecutor() , columns, required_columns = set(columns),
-                            partitioner=BroadcastPartitioner(), placement_strategy = SingleChannelStrategy())
+        stream = selected_stream.stateful_transform(
+            executor,
+            columns,
+            required_columns=set(columns),
+            partitioner=PassThroughPartitioner(),
+        )
+        return stream.stateful_transform(
+            MeanExecutor(),
+            columns,
+            required_columns=set(columns),
+            partitioner=BroadcastPartitioner(),
+            placement_strategy=SingleChannelStrategy(),
+        )
 
-    def gramian(self, columns, demean = None):
-
+    def gramian(self, columns, demean=None):
         """
         This will compute DataStream[columns]^T * DataStream[columns]. The result will be len(columns) * len(columns), with schema same as columns.
 
@@ -1057,16 +1229,18 @@ class DataStream(IDataStream):
 
         def udf2(x):
             x = x.select(columns).to_numpy() - demean
-            with threadpool_limits(limits=8, user_api='blas'):
+            with threadpool_limits(limits=8, user_api="blas"):
                 product = np.dot(x.transpose(), x)
-            return polars.from_numpy(product, schema = columns)
+            return polars.from_numpy(product, schema=columns)
 
         for col in columns:
             assert col in self.schema
 
         if demean is not None:
             assert type(demean) == np.ndarray, "demean must be a numpy array"
-            assert len(demean) == len(columns), "demean must be the same length as columns"
+            assert len(demean) == len(
+                columns
+            ), "demean must be the same length as columns"
         else:
             demean = np.zeros(len(columns))
 
@@ -1074,33 +1248,48 @@ class DataStream(IDataStream):
             df = self._get_materialized_df()
             stuff = df.select(columns).to_numpy() - demean
             product = np.dot(stuff.transpose(), stuff)
-            return self.quokka_context.from_polars(polars.from_numpy(product, schema = columns))
+            return self.quokka_context.from_polars(
+                polars.from_numpy(product, schema=columns)
+            )
 
         class AggExecutor(Executor):
             def __init__(self) -> None:
                 self.state = None
-            def execute(self,batches,stream_id, executor_id):
+
+            def execute(self, batches, stream_id, executor_id):
                 for batch in batches:
-                    #print(batch)
+                    # print(batch)
                     if self.state is None:
                         self.state = polars.from_arrow(batch)
                     else:
                         self.state += polars.from_arrow(batch)
-            def done(self,executor_id):
+
+            def done(self, executor_id):
                 return self.state
 
         local_agg_executor = AggExecutor()
         agg_executor = AggExecutor()
 
         stream = self.select(columns)
-        stream = stream.transform( udf2, new_schema = columns, required_columns = set(columns), foldable=True)
-        stream = stream.stateful_transform( local_agg_executor , columns, required_columns = set(columns),
-                            partitioner=PassThroughPartitioner(), placement_strategy = CustomChannelsStrategy(1))
-        return stream.stateful_transform( agg_executor , columns, required_columns = set(columns),
-                            partitioner=BroadcastPartitioner(), placement_strategy = SingleChannelStrategy())
+        stream = stream.transform(
+            udf2, new_schema=columns, required_columns=set(columns), foldable=True
+        )
+        stream = stream.stateful_transform(
+            local_agg_executor,
+            columns,
+            required_columns=set(columns),
+            partitioner=PassThroughPartitioner(),
+            placement_strategy=CustomChannelsStrategy(1),
+        )
+        return stream.stateful_transform(
+            agg_executor,
+            columns,
+            required_columns=set(columns),
+            partitioner=BroadcastPartitioner(),
+            placement_strategy=SingleChannelStrategy(),
+        )
 
     def covariance(self, columns):
-
         """
         Computes the covariance matrix of the columns.
 
@@ -1117,39 +1306,67 @@ class DataStream(IDataStream):
         class AggExecutor(Executor):
             def __init__(self) -> None:
                 self.state = None
-            def execute(self,batches,stream_id, executor_id):
-                psum = polars.from_arrow(pa.concat_tables(batches)).select(columns + ["__len__"]).to_numpy().sum(axis=0)
+
+            def execute(self, batches, stream_id, executor_id):
+                psum = (
+                    polars.from_arrow(pa.concat_tables(batches))
+                    .select(columns + ["__len__"])
+                    .to_numpy()
+                    .sum(axis=0)
+                )
                 if self.state is None:
                     self.state = psum
                 else:
                     self.state += psum
-            def done(self,executor_id):
-                x = polars.from_numpy(np.expand_dims(self.state,0), schema = columns + ["__len__"])
+
+            def done(self, executor_id):
+                x = polars.from_numpy(
+                    np.expand_dims(self.state, 0), schema=columns + ["__len__"]
+                )
                 # print(x)
                 return x
 
         def udf2(x):
-            x =  polars.from_numpy(np.expand_dims(x.select(columns).to_numpy().sum(axis = 0),0) , schema = columns).hstack(polars.from_dict({"__len__": [len(x)]}))
+            x = polars.from_numpy(
+                np.expand_dims(x.select(columns).to_numpy().sum(axis=0), 0),
+                schema=columns,
+            ).hstack(polars.from_dict({"__len__": [len(x)]}))
             # print(x)
             return x
 
-        stream = self.transform( udf2, new_schema = columns + ["__len__"], required_columns = set(columns), foldable=True)
+        stream = self.transform(
+            udf2,
+            new_schema=columns + ["__len__"],
+            required_columns=set(columns),
+            foldable=True,
+        )
         local_agg_executor = AggExecutor()
         agg_executor = AggExecutor()
-        stream = stream.stateful_transform( local_agg_executor , columns + ["__len__"], required_columns = set(columns + ["__len__"]),
-                            partitioner=PassThroughPartitioner(), placement_strategy = CustomChannelsStrategy(1))
-        mean = stream.stateful_transform( agg_executor , columns + ["__len__"], required_columns = set(columns + ["__len__"]),
-                            partitioner=BroadcastPartitioner(), placement_strategy = SingleChannelStrategy()).collect()
+        stream = stream.stateful_transform(
+            local_agg_executor,
+            columns + ["__len__"],
+            required_columns=set(columns + ["__len__"]),
+            partitioner=PassThroughPartitioner(),
+            placement_strategy=CustomChannelsStrategy(1),
+        )
+        mean = stream.stateful_transform(
+            agg_executor,
+            columns + ["__len__"],
+            required_columns=set(columns + ["__len__"]),
+            partitioner=BroadcastPartitioner(),
+            placement_strategy=SingleChannelStrategy(),
+        ).collect()
         count = mean["__len__"][0]
         # print("COUNT", count)
         mean = mean.select(columns)
         # print("MEAN", mean)
         mean /= count
 
-        return self.gramian(columns, demean = np.squeeze(mean.to_numpy())).collect() / count
+        return (
+            self.gramian(columns, demean=np.squeeze(mean.to_numpy())).collect() / count
+        )
 
-    def with_columns_sql(self, new_columns: str, foldable = True):
-
+    def with_columns_sql(self, new_columns: str, foldable=True):
         """
         This is the SQL analog of with_columns.
 
@@ -1185,12 +1402,16 @@ class DataStream(IDataStream):
         required_columns = set()
         for statement in statements:
             node = sqlglot.parse_one(statement)
-            assert type(node) == sqlglot.exp.Alias, "must provide new name for each column: x1 as some_compute, x2 as some_compute, etc."
+            assert (
+                type(node) == sqlglot.exp.Alias
+            ), "must provide new name for each column: x1 as some_compute, x2 as some_compute, etc."
             new_column_names.append(node.alias)
-            required_columns = required_columns.union(required_columns_from_exp(node.this))
+            required_columns = required_columns.union(
+                required_columns_from_exp(node.this)
+            )
 
         def polars_func(batch):
-            con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
+            con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
             batch_arrow = batch.to_arrow()
             return polars.from_arrow(con.execute(sql_statement).arrow())
 
@@ -1198,18 +1419,20 @@ class DataStream(IDataStream):
             sources={0: self},
             partitioners={0: PassThroughPartitioner()},
             node=MapNode(
-                schema=self.schema+ new_column_names,
+                schema=self.schema + new_column_names,
                 schema_mapping={
-                    **{new_column: {-1: new_column} for new_column in new_column_names}, **{col: {0: col} for col in self.schema}},
+                    **{new_column: {-1: new_column} for new_column in new_column_names},
+                    **{col: {0: col} for col in self.schema},
+                },
                 required_columns={0: required_columns},
                 function=polars_func,
-                foldable=foldable),
+                foldable=foldable,
+            ),
             schema=self.schema + new_column_names,
-            sorted = self.sorted
-            )
+            sorted=self.sorted,
+        )
 
     def with_columns(self, new_columns: dict, required_columns=set(), foldable=True):
-
         """
 
         This will create new columns from certain columns in the dataframe. This is similar to Polars `with_columns`, Spark `with_columns`, etc. As usual,
@@ -1275,9 +1498,13 @@ class DataStream(IDataStream):
         sql_statement = "select *"
 
         for new_column in new_columns:
-            assert new_column not in self.schema, "For now new columns cannot have same names as existing columns"
+            assert (
+                new_column not in self.schema
+            ), "For now new columns cannot have same names as existing columns"
             transform = new_columns[new_column]
-            assert type(transform) == type(lambda x:1) or type(transform) == Expression, "Transform must be a function or a Quokka Expression"
+            assert (
+                type(transform) == type(lambda x: 1) or type(transform) == Expression
+            ), "Transform must be a function or a Quokka Expression"
             if type(transform) == Expression:
                 required_columns = required_columns.union(transform.required_columns())
                 sql_statement += ", " + transform.sql() + " as " + new_column
@@ -1289,31 +1516,49 @@ class DataStream(IDataStream):
 
         def polars_func(batch):
 
-            con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
-            if sql_statement != "select *": # if there are any columns to add
+            con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
+            if sql_statement != "select *":  # if there are any columns to add
                 batch_arrow = batch.to_arrow()
-                batch = polars.from_arrow(con.execute(sql_statement + " from batch_arrow").arrow())
+                batch = polars.from_arrow(
+                    con.execute(sql_statement + " from batch_arrow").arrow()
+                )
 
-            batch = batch.with_columns([polars.Series(name=column_name, values=new_columns[column_name](batch)) for column_name in new_column_names if type(new_columns[column_name]) == type(lambda x:1)])
+            batch = batch.with_columns(
+                [
+                    polars.Series(
+                        name=column_name, values=new_columns[column_name](batch)
+                    )
+                    for column_name in new_column_names
+                    if type(new_columns[column_name]) == type(lambda x: 1)
+                ]
+            )
             return batch
 
         return self.quokka_context.new_stream(
             sources={0: self},
             partitioners={0: PassThroughPartitioner()},
             node=MapNode(
-                schema=self.schema+ new_column_names,
+                schema=self.schema + new_column_names,
                 schema_mapping={
-                    **{new_column: {-1: new_column} for new_column in new_column_names}, **{col: {0: col} for col in self.schema}},
+                    **{new_column: {-1: new_column} for new_column in new_column_names},
+                    **{col: {0: col} for col in self.schema},
+                },
                 required_columns={0: required_columns},
                 function=polars_func,
-                foldable=foldable),
+                foldable=foldable,
+            ),
             schema=self.schema + new_column_names,
-            sorted = self.sorted
-            )
+            sorted=self.sorted,
+        )
 
-    def stateful_transform(self, executor: Executor, new_schema: list, required_columns: set,
-                           partitioner=PassThroughPartitioner(), placement_strategy = CustomChannelsStrategy(1)):
-
+    def stateful_transform(
+        self,
+        executor: Executor,
+        new_schema: list,
+        required_columns: set,
+        partitioner=PassThroughPartitioner(),
+        placement_strategy=CustomChannelsStrategy(1),
+    ):
         """
 
         **EXPERIMENTAL API**
@@ -1345,7 +1590,9 @@ class DataStream(IDataStream):
         """
 
         assert type(required_columns) == set
-        assert issubclass(type(executor), Executor), "user defined executor must be an instance of a \
+        assert issubclass(
+            type(executor), Executor
+        ), "user defined executor must be an instance of a \
             child class of the Executor class defined in pyquokka.executors. You must override the execute and done methods."
 
         select_stream = self.select(required_columns)
@@ -1355,7 +1602,7 @@ class DataStream(IDataStream):
             # cannot push through any predicates or projections!
             schema_mapping={col: {-1: col} for col in new_schema},
             required_columns={0: required_columns},
-            operator=executor
+            operator=executor,
         )
 
         custom_node.set_placement_strategy(placement_strategy)
@@ -1365,11 +1612,9 @@ class DataStream(IDataStream):
             partitioners={0: partitioner},
             node=custom_node,
             schema=new_schema,
-
         )
 
     def distinct(self, keys: list):
-
         """
         Return a new DataStream with specified columns and unique rows. This is like `SELECT DISTINCT(KEYS) FROM ...` in SQL.
 
@@ -1401,7 +1646,9 @@ class DataStream(IDataStream):
         if type(keys) == str:
             keys = [keys]
         assert type(keys) == list, "keys must be a list of column names"
-        assert all([key in self.schema for key in keys]), "keys must be a subset of the columns in the DataStream"
+        assert all(
+            [key in self.schema for key in keys]
+        ), "keys must be a subset of the columns in the DataStream"
 
         select_stream = self.select(keys)
 
@@ -1413,14 +1660,21 @@ class DataStream(IDataStream):
                 # this is a stateful node, but predicates and projections can be pushed down.
                 schema_mapping={col: {0: col} for col in keys},
                 required_columns={0: set(keys)},
-                operator=DistinctExecutor(keys)
+                operator=DistinctExecutor(keys),
             ),
             schema=keys,
-
         )
 
-    def join(self, right, on=None, left_on=None, right_on=None, suffix="_2", how="inner", maintain_sort_order=None):
-
+    def join(
+        self,
+        right,
+        on=None,
+        left_on=None,
+        right_on=None,
+        suffix="_2",
+        how="inner",
+        maintain_sort_order=None,
+    ):
         """
         Join a DataStream with another DataStream. This may result in a distributed hash join or a broadcast join depending on cardinality estimates.
 
@@ -1450,7 +1704,9 @@ class DataStream(IDataStream):
         """
 
         assert how in {"inner", "left", "semi", "anti"}
-        assert issubclass(type(right), DataStream), "must join against a Quokka DataStream"
+        assert issubclass(
+            type(right), DataStream
+        ), "must join against a Quokka DataStream"
 
         if maintain_sort_order is not None:
 
@@ -1468,9 +1724,11 @@ class DataStream(IDataStream):
                 else:
                     assert right.sorted is not None
                 if how == "left":
-                    assert maintain_sort_order == "right", "in a left join, can only maintain order of the right table"
+                    assert (
+                        maintain_sort_order == "right"
+                    ), "in a left join, can only maintain order of the right table"
 
-        #if type(right) == polars.DataFrame and right.to_arrow().nbytes > 10485760:
+        # if type(right) == polars.DataFrame and right.to_arrow().nbytes > 10485760:
         #    raise Exception("You cannot join a DataStream against a Polars DataFrame more than 10MB in size. Sorry.")
 
         if on is None:
@@ -1485,7 +1743,7 @@ class DataStream(IDataStream):
             on = None
 
         # we can't do this check since schema is now a list of names with no type info. This should change in the future.
-        #assert node1.schema[left_on] == node2.schema[right_on], "join column has different schema in tables"
+        # assert node1.schema[left_on] == node2.schema[right_on], "join column has different schema in tables"
 
         new_schema = self.schema.copy()
         if self.materialized:
@@ -1510,11 +1768,13 @@ class DataStream(IDataStream):
             if col == right_on:
                 continue
             if col in new_schema:
-                assert col + \
-                    suffix not in new_schema, (
-                        "the suffix was not enough to guarantee unique col names", col + suffix, new_schema)
+                assert col + suffix not in new_schema, (
+                    "the suffix was not enough to guarantee unique col names",
+                    col + suffix,
+                    new_schema,
+                )
                 new_schema.append(col + suffix)
-                schema_mapping[col+suffix] = {right_table_id: col + suffix}
+                schema_mapping[col + suffix] = {right_table_id: col + suffix}
                 rename_dict[col] = col + suffix
             else:
                 new_schema.append(col)
@@ -1528,7 +1788,9 @@ class DataStream(IDataStream):
         if len(rename_dict) > 0:
             right = right.rename(rename_dict)
 
-        if (not self.materialized and not right.materialized) or (self.materialized and not right.materialized and how != "inner"):
+        if (not self.materialized and not right.materialized) or (
+            self.materialized and not right.materialized and how != "inner"
+        ):
 
             # if self.materialized, rewrite the schema_mapping
             for col in schema_mapping:
@@ -1542,19 +1804,25 @@ class DataStream(IDataStream):
             else:
                 assume_sorted = {1: True}
 
+            print(
+                f"datastream, creating join node with specs {(how, {0: left_on, 1: right_on})}"
+            )
             return self.quokka_context.new_stream(
                 sources={0: self, 1: right},
-                partitioners={0: HashPartitioner(
-                    left_on), 1: HashPartitioner(right_on)},
+                partitioners={
+                    0: HashPartitioner(left_on),
+                    1: HashPartitioner(right_on),
+                },
                 node=JoinNode(
                     schema=new_schema,
                     schema_mapping=schema_mapping,
                     # required_columns={0: {left_on, "l_suppkey"}, 1: {right_on, "l_suppkey"}} if how in {"semi","anti"} else {0: {left_on}, 1: {right_on}},
                     required_columns={0: {left_on}, 1: {right_on}},
                     join_spec=(how, {0: left_on, 1: right_on}),
-                    assume_sorted=assume_sorted),
+                    assume_sorted=assume_sorted,
+                ),
                 schema=new_schema,
-                )
+            )
 
         elif self.materialized and not right.materialized:
 
@@ -1573,10 +1841,15 @@ class DataStream(IDataStream):
                     schema_mapping=schema_mapping,
                     required_columns={1: {right_on}},
                     operator=BroadcastJoinExecutor(
-                        self._get_materialized_df(), small_on=left_on, big_on=right_on, suffix=suffix, how=how)
+                        self._get_materialized_df(),
+                        small_on=left_on,
+                        big_on=right_on,
+                        suffix=suffix,
+                        how=how,
+                    ),
                 ),
                 schema=new_schema,
-                )
+            )
             if right_on == left_on:
                 return new_stream
             else:
@@ -1592,20 +1865,26 @@ class DataStream(IDataStream):
                     schema_mapping=schema_mapping,
                     required_columns={0: {left_on}},
                     operator=BroadcastJoinExecutor(
-                        right._get_materialized_df(), small_on=right_on, big_on=left_on, suffix=suffix, how=how)
+                        right._get_materialized_df(),
+                        small_on=right_on,
+                        big_on=left_on,
+                        suffix=suffix,
+                        how=how,
+                    ),
                 ),
                 schema=new_schema,
-                )
+            )
 
         else:
 
             right_df = right._get_materialized_df()
             left_df = self._get_materialized_df()
-            result = left_df.join(right_df, how=how, left_on=left_on, right_on=right_on, suffix=suffix)
+            result = left_df.join(
+                right_df, how=how, left_on=left_on, right_on=right_on, suffix=suffix
+            )
             return self.quokka_context.from_polars(result)
 
     def groupby(self, groupby: list, orderby=None):
-
         """
         Group a DataStream on a list of columns, optionally specifying an ordering requirement.
 
@@ -1633,8 +1912,9 @@ class DataStream(IDataStream):
         if type(groupby) == str:
             groupby = [groupby]
 
-        assert type(groupby) == list and len(
-            groupby) > 0, "must specify at least one group key as a list of group keys, i.e. [key1,key2]"
+        assert (
+            type(groupby) == list and len(groupby) > 0
+        ), "must specify at least one group key as a list of group keys, i.e. [key1,key2]"
         if orderby is not None:
             assert type(orderby) == list
             for i in range(len(orderby)):
@@ -1650,7 +1930,6 @@ class DataStream(IDataStream):
         return GroupedDataStream(self, groupby=groupby, orderby=orderby)
 
     def windowed_transform(self, window: Window, trigger: Trigger):
-
         """
         This is a helper function for `windowed_aggregate` and `windowed_aggregate_with_state`. It is not meant to be used directly.
         aggregations should be a list of polars expressions.
@@ -1659,7 +1938,9 @@ class DataStream(IDataStream):
         time_col = window.order_by
         by_col = window.partition_by
 
-        assert self.sorted is not None, "DataStream must be sorted before windowed aggregation."
+        assert (
+            self.sorted is not None
+        ), "DataStream must be sorted before windowed aggregation."
         assert time_col in self.sorted and self.sorted[time_col] == "stride"
 
         required_columns = window.get_required_cols()
@@ -1672,25 +1953,22 @@ class DataStream(IDataStream):
         select_stream = self.select(required_columns)
 
         if issubclass(type(window), HoppingWindow):
-            operator = HoppingWindowExecutor(
-                time_col, by_col, window, trigger)
+            operator = HoppingWindowExecutor(time_col, by_col, window, trigger)
         elif issubclass(type(window), SlidingWindow):
-            operator = SlidingWindowExecutor(
-                time_col, by_col, window, trigger)
+            operator = SlidingWindowExecutor(time_col, by_col, window, trigger)
         elif issubclass(type(window), SessionWindow):
-            operator = SessionWindowExecutor(
-                time_col, by_col, window, trigger)
+            operator = SessionWindowExecutor(time_col, by_col, window, trigger)
         else:
             raise Exception
 
         node = StatefulNode(
-                schema=new_schema,
-                # cannot push through any predicates or projections!
-                schema_mapping={col: {-1: col} for col in new_schema},
-                required_columns={0: required_columns},
-                operator=operator,
-                assume_sorted={0:True}
-            )
+            schema=new_schema,
+            # cannot push through any predicates or projections!
+            schema_mapping={col: {-1: col} for col in new_schema},
+            required_columns={0: required_columns},
+            operator=operator,
+            assume_sorted={0: True},
+        )
 
         node.set_output_sorted_reqs({time_col: ("sorted_within_key", by_col)})
 
@@ -1701,7 +1979,7 @@ class DataStream(IDataStream):
             schema=new_schema,
         )
 
-    def top_k(self, columns, k, descending = None):
+    def top_k(self, columns, k, descending=None):
         """
         This is a topk function that effectively performs select * from stream order by columns limit k.
         The strategy is to take k rows from each batch coming in and do a final sort and limit k in a stateful executor.
@@ -1745,20 +2023,27 @@ class DataStream(IDataStream):
             else:
                 new_columns.append(columns[i] + " asc")
 
-        sql_statement = "select * from batch_arrow order by " + ",".join(new_columns) + " limit " + str(k)
+        sql_statement = (
+            "select * from batch_arrow order by "
+            + ",".join(new_columns)
+            + " limit "
+            + str(k)
+        )
 
         def f(df):
             batch_arrow = df.to_arrow()
-            con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
+            con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
             return polars.from_arrow(con.execute(sql_statement).arrow())
 
-        transformed = self.transform(f, new_schema = self.schema, required_columns=set(self.schema))
+        transformed = self.transform(
+            f, new_schema=self.schema, required_columns=set(self.schema)
+        )
 
         topk_node = StatefulNode(
             schema=self.schema,
             schema_mapping={col: {0: col} for col in self.schema},
             required_columns={0: set(columns)},
-            operator=ConcatThenSQLExecutor(sql_statement)
+            operator=ConcatThenSQLExecutor(sql_statement),
         )
         topk_node.set_placement_strategy(SingleChannelStrategy())
         return self.quokka_context.new_stream(
@@ -1768,14 +2053,18 @@ class DataStream(IDataStream):
             schema=self.schema,
         )
 
-    def _grouped_count_distinct(self, groupby: list, count_col: str, orderby: list = None):
+    def _grouped_count_distinct(
+        self, groupby: list, count_col: str, orderby: list = None
+    ):
 
         assert type(groupby) == list
         assert type(count_col) == str
         new_schema = [count_col]
 
         if len(groupby) == 0:
-            sql_statement = "select count(distinct {}) as {} from batch_arrow".format(count_col, count_col)
+            sql_statement = "select count(distinct {}) as {} from batch_arrow".format(
+                count_col, count_col
+            )
         else:
             sql_statement = "select {}, count(distinct {}) as {} from batch_arrow group by {}".format(
                 ",".join(groupby), count_col, count_col, ",".join(groupby)
@@ -1794,7 +2083,9 @@ class DataStream(IDataStream):
         agg_node = StatefulNode(
             schema=groupby + new_schema,
             schema_mapping={
-                    **{new_column: {-1: new_column} for new_column in new_schema}, **{col: {0: col} for col in groupby}},
+                **{new_column: {-1: new_column} for new_column in new_schema},
+                **{col: {0: col} for col in groupby},
+            },
             required_columns={0: set(groupby + [count_col])},
             operator=ConcatThenSQLExecutor(sql_statement),
         )
@@ -1813,20 +2104,22 @@ class DataStream(IDataStream):
                 partitioners={0: BroadcastPartitioner()},
                 node=agg_node,
                 schema=groupby + new_schema,
-
             )
         return aggregated_stream
 
-
-    def _grouped_aggregate_sql(self, groupby: list, aggregations: str, orderby = None):
+    def _grouped_aggregate_sql(self, groupby: list, aggregations: str, orderby=None):
 
         try:
-            batch_agg, final_agg, new_schema = sql_utils.parse_multiple_aggregations(aggregations)
+            batch_agg, final_agg, new_schema = sql_utils.parse_multiple_aggregations(
+                aggregations
+            )
         except Exception as e:
             raise Exception("Error parsing aggregations: " + str(e))
 
         clauses = aggregations.split(",")
-        assert all(["as" in clause or "AS" in clause for clause in clauses]), "must provide alias for each aggregation"
+        assert all(
+            ["as" in clause or "AS" in clause for clause in clauses]
+        ), "must provide alias for each aggregation"
 
         agged = self.transform_sql(batch_agg, groupby)
 
@@ -1834,9 +2127,11 @@ class DataStream(IDataStream):
         agg_node = StatefulNode(
             schema=groupby + new_schema,
             schema_mapping={
-                    **{new_column: {-1: new_column} for new_column in new_schema}, **{col: {0: col} for col in groupby}},
+                **{new_column: {-1: new_column} for new_column in new_schema},
+                **{col: {0: col} for col in groupby},
+            },
             required_columns={0: set(agged.schema)},
-            operator=SQLAggExecutor(groupby, orderby, final_agg)
+            operator=SQLAggExecutor(groupby, orderby, final_agg),
         )
         if len(groupby) > 0:
             aggregated_stream = self.quokka_context.new_stream(
@@ -1844,7 +2139,6 @@ class DataStream(IDataStream):
                 partitioners={0: HashPartitioner(groupby[0])},
                 node=agg_node,
                 schema=groupby + new_schema,
-
             )
         else:
             agg_node.set_placement_strategy(SingleChannelStrategy())
@@ -1853,7 +2147,6 @@ class DataStream(IDataStream):
                 partitioners={0: BroadcastPartitioner()},
                 node=agg_node,
                 schema=groupby + new_schema,
-
             )
         return aggregated_stream
 
@@ -1886,7 +2179,6 @@ class DataStream(IDataStream):
         return self._grouped_aggregate_sql(groupby, sql, orderby)
 
     def count_distinct(self, col):
-
         """
         Count the number of distinct values of a column. This may result in out of memory. This is not approximate.
 
@@ -1898,7 +2190,6 @@ class DataStream(IDataStream):
         return self._grouped_count_distinct([], col)
 
     def agg(self, aggregations):
-
         """
         Aggregate this DataStream according to the defined aggregations without any pre-grouping. This is similar to Pandas `df.agg()`.
         The result will be one row.
@@ -1934,7 +2225,6 @@ class DataStream(IDataStream):
         return self._grouped_aggregate([], aggregations, None)
 
     def agg_sql(self, aggregations: str):
-
         """
         This is the SQL version of `agg`. It takes a SQL statement as input instead of a dictionary. The SQL statement must be a valid SQL statement.
         The requirements are similar to what you need for `transform_sql`. Please look at the examples. Exotic SQL statements may not work, such as `count_distinct`, `percentile` etc.
@@ -1962,15 +2252,13 @@ class DataStream(IDataStream):
         return self._grouped_aggregate_sql([], aggregations, None)
 
     def aggregate(self, aggregations):
-
         """
         Alias of `agg`.
         """
 
         return self.agg(aggregations)
 
-    def count(self, collect = True):
-
+    def count(self, collect=True):
         """
         Return total row count.
 
@@ -1978,12 +2266,11 @@ class DataStream(IDataStream):
             collect (bool): if True, return a Polars DataFrame. If False, return a Quokka DataStream.
         """
         if collect:
-            return self.agg({"*":"count"}).collect()
+            return self.agg({"*": "count"}).collect()
         else:
-            return self.agg({"*":"count"})
+            return self.agg({"*": "count"})
 
-    def sum(self, columns, collect = True):
-
+    def sum(self, columns, collect=True):
         """
         Return the sums of the specified columns.
 
@@ -2003,8 +2290,7 @@ class DataStream(IDataStream):
         else:
             return self.agg({col: "sum" for col in columns})
 
-    def max(self, columns, collect = True):
-
+    def max(self, columns, collect=True):
         """
         Return the maximum values of the specified columns.
 
@@ -2024,8 +2310,7 @@ class DataStream(IDataStream):
         else:
             return self.agg({col: "max" for col in columns})
 
-    def min(self, columns, collect = True):
-
+    def min(self, columns, collect=True):
         """
         Return the minimum values of the specified columns.
 
@@ -2044,8 +2329,7 @@ class DataStream(IDataStream):
         else:
             return self.agg({col: "min" for col in columns})
 
-    def mean(self, columns, collect = True):
-
+    def mean(self, columns, collect=True):
         """
         Return the mean values of the specified columns.
 
@@ -2072,18 +2356,29 @@ class GroupedDataStream:
         self.groupby = groupby if type(groupby) == list else [groupby]
         self.orderby = orderby
 
-    def cogroup(self, right, executor: Executor, new_schema: list, required_cols_left = None, required_cols_right = None):
+    def cogroup(
+        self,
+        right,
+        executor: Executor,
+        new_schema: list,
+        required_cols_left=None,
+        required_cols_right=None,
+    ):
         """
         Purely Experimental API.
         """
 
-        assert (type(right) == GroupedDataStream) and issubclass(type(executor), Executor)
+        assert (type(right) == GroupedDataStream) and issubclass(
+            type(executor), Executor
+        )
 
-        assert len(self.groupby) == 1 and len(right.groupby) == 1, "we only support single key partition functions right now"
+        assert (
+            len(self.groupby) == 1 and len(right.groupby) == 1
+        ), "we only support single key partition functions right now"
         assert self.groupby[0] == right.groupby[0], "must be grouped by the same key"
         copartitioner = self.groupby[0]
 
-        schema_mapping={col: {-1: col} for col in new_schema}
+        schema_mapping = {col: {-1: col} for col in new_schema}
 
         if required_cols_left is None:
             required_cols_left = set(self.source_data_stream.schema)
@@ -2099,21 +2394,22 @@ class GroupedDataStream:
                 required_cols_right = set(required_cols_right)
             assert type(required_cols_right) == set
 
-
         return self.source_data_stream.quokka_context.new_stream(
             sources={0: self.source_data_stream, 1: right.source_data_stream},
-            partitioners={0: HashPartitioner(
-                copartitioner), 1: HashPartitioner(copartitioner)},
+            partitioners={
+                0: HashPartitioner(copartitioner),
+                1: HashPartitioner(copartitioner),
+            },
             node=StatefulNode(
                 schema=new_schema,
                 schema_mapping=schema_mapping,
                 required_columns={0: required_cols_left, 1: required_cols_right},
-                operator= executor),
+                operator=executor,
+            ),
             schema=new_schema,
-            )
+        )
 
     def count_distinct(self, col: str):
-
         """
         Count the number of distinct values of a column for each group. This may result in out of memory. This is not approximate.
 
@@ -2122,10 +2418,11 @@ class GroupedDataStream:
 
         """
 
-        return self.source_data_stream._grouped_count_distinct(self.groupby, col, self.orderby)
+        return self.source_data_stream._grouped_count_distinct(
+            self.groupby, col, self.orderby
+        )
 
     def agg(self, aggregations: dict):
-
         """
         Aggregate this GroupedDataStream according to the defined aggregations. This is similar to Pandas `df.groupby().agg()`.
         The result's length will be however number of rows as there are unique group keys combinations.
@@ -2159,10 +2456,11 @@ class GroupedDataStream:
             >>> f = d.groupby(["l_returnflag", "l_linestatus"]).agg({"l_quantity":["sum","avg"], "l_extendedprice":["sum","avg"], "disc_price":"sum", "l_discount":"min","*":"count"})
         """
 
-        return self.source_data_stream._grouped_aggregate(self.groupby, aggregations, self.orderby)
+        return self.source_data_stream._grouped_aggregate(
+            self.groupby, aggregations, self.orderby
+        )
 
     def agg_sql(self, aggregations: str):
-
         """
         The SQL version of `agg`. Look at the examples.
 
@@ -2185,7 +2483,9 @@ class GroupedDataStream:
 
         """
 
-        return self.source_data_stream._grouped_aggregate_sql(self.groupby, aggregations, self.orderby)
+        return self.source_data_stream._grouped_aggregate_sql(
+            self.groupby, aggregations, self.orderby
+        )
 
     def aggregate(self, aggregations: dict):
         """
