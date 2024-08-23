@@ -1000,7 +1000,7 @@ class QuokkaContext(IQuokkaContext):
         return DataStream(self, dataset.schema, self.latest_node_id - 1)
 
     def read_ray_dataset(self, dataset, get_size=True):
-        dataset_id = ray.get(self.dataset_manager.create_dataset.remote())
+        dataset_id: DatasetId = ray.get(self.dataset_manager.create_dataset.remote())
         my_dataset = Dataset(dataset.schema().names, self.dataset_manager, dataset_id)
         arrow_refs = dataset.to_arrow_refs()
         if get_size:
@@ -1302,6 +1302,7 @@ class QuokkaContext(IQuokkaContext):
             if issubclass(type(node), SourceNode):
                 task_graph_nodes[node_id] = node.lower(task_graph)
             else:
+                node = cast(TaskNode, node)
                 parent_nodes = {
                     parent_idx: task_graph_nodes[node.parents[parent_idx]]
                     for parent_idx in node.parents

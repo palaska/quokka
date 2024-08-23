@@ -443,7 +443,7 @@ class InputLanceNode(SourceNode):
         )
         if self.probe_df is not None:
             lance_reader.set_probe_df(self.probe_df, self.probe_df_col, self.k)
-        node = task_graph.new_input_reader_node(
+        node: TaskGraphNodeId = task_graph.new_input_reader_node(
             lance_reader, self.stage, self.placement_strategy
         )
         if self.probe_df is not None:
@@ -465,7 +465,7 @@ class InputLanceNode(SourceNode):
 class InputS3ParquetNode(SourceNode):
     def __init__(
         self,
-        files,
+        files: list[str],
         schema: Schema,
         predicate=None,
         projection=None,
@@ -635,7 +635,12 @@ class TaskNode(Node):
         for target in self.targets:
             self.cardinality[target] = None
 
-    def lower(self, task_graph, parent_nodes, parent_source_info):
+    def lower(
+        self,
+        task_graph: TaskGraph,
+        parent_nodes: dict[SourceDataStreamIndex, TaskGraphNodeId],
+        parent_source_info: dict[SourceDataStreamIndex, TargetInfo],
+    ):
         raise Exception("Abstract class TaskNode cannot be lowered")
 
 

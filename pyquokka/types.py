@@ -26,8 +26,29 @@ Schema = Sequence[ColumnName]
 SourceDataStreamIndex = int
 NodeType = Literal["input", "exec"]
 ExplainMode = Literal["graph", "text"]
-
+ChannelId = int
+ChannelSeqId = int
+SeqInfo = Any
+NumTotalChannels = int
 TaskGraphNodeId = int
+
+# Tasks
+TaskType = Literal["input", "inputtape", "exec", "exectape", "replay"]
+StateSeq = Any
+OutSeq = Any
+# List[DF[source_actor_id, source_channel_id, min_seq]]
+InputReqs = List[polars.DataFrame]
+LastStateSeq = Any
+ReplaySpecs = Any
+InputObject = Any
+InputTaskTuple = Tuple[TaskGraphNodeId, ChannelId, ChannelSeqId, InputObject]
+TapedInputTaskTuple = Tuple[TaskGraphNodeId, ChannelId, list[ChannelSeqId]]
+ExecutorTaskTuple = Tuple[TaskGraphNodeId, ChannelId, StateSeq, OutSeq, InputReqs]
+TapedExecutorTaskTuple = Tuple[
+    TaskGraphNodeId, ChannelId, StateSeq, OutSeq, LastStateSeq
+]
+ReplayTaskTuple = Tuple[TaskGraphNodeId, ChannelId, ReplaySpecs]
+
 TaskGraphNodeType = Literal["input", "exec"]
 SortOrder = Literal["stride", "range"]
 JoinType = Literal["inner", "left", "semi", "anti"]
@@ -36,16 +57,13 @@ ResolvedJoinSpec = Tuple[JoinType, List[Tuple[SourceDataStreamIndex, ColumnName]
 JoinSpec = Union[UnresolvedJoinSpec, ResolvedJoinSpec]
 
 
-class INode:
-    pass
+class INode: ...
 
 
-class IDataStream:
-    pass
+class IDataStream: ...
 
 
-class ICoordinator:
-    pass
+class ICoordinator: ...
 
 
 class ICatalog:
@@ -54,25 +72,20 @@ class ICatalog:
         table_id: CatalogTableId,
         predicate: sqlglot.exp.Expression,
         filters_list: Optional[Any] = None,
-    ) -> float:
-        pass
+    ) -> float: ...
 
     def register_s3_csv_source(
         self, bucket: str, key: str, schema: Schema, sep: str, total_size: int
-    ) -> CatalogTableId:
-        pass
+    ) -> CatalogTableId: ...
 
 
-class IDatasetManager:
-    pass
+class IDatasetManager: ...
 
 
-class ITaskManager:
-    pass
+class ITaskManager: ...
 
 
-class IPartitioner:
-    pass
+class IPartitioner(Protocol): ...
 
 
 class Cluster:
@@ -86,8 +99,10 @@ class IDataSet:
     source_node_id: NodeId
 
 
-class IDataset:
-    pass
+DatasetId = int
+
+
+class IDataset: ...
 
 
 class IQuokkaContext:
@@ -115,8 +130,7 @@ class IQuokkaContext:
 
     def read_csv(
         self, table_location: str, schema: Optional[Schema], has_header: bool, sep=str
-    ) -> IDataStream:
-        pass
+    ) -> IDataStream: ...
 
     def new_stream(
         self,
@@ -126,11 +140,9 @@ class IQuokkaContext:
         schema: Schema,
         sorted: dict,
         materialized: bool,
-    ) -> IDataStream:
-        pass
+    ) -> IDataStream: ...
 
-    def new_dataset(self, source: IDataStream, schema: Schema) -> IDataSet:
-        pass
+    def new_dataset(self, source: IDataStream, schema: Schema) -> IDataSet: ...
 
     """
   If explain is True, returns None.
@@ -140,5 +152,9 @@ class IQuokkaContext:
 
     def execute_node(
         self, node_id: NodeId, explain: bool, mode: ExplainMode, collect: bool
-    ) -> polars.DataFrame | polars.Series | IDataset | None:
-        pass
+    ) -> polars.DataFrame | polars.Series | IDataset | None: ...
+
+
+class Reader(Protocol):
+
+    def get_own_state(self, num_channels: int) -> Dict[ChannelId, List[SeqInfo]]: ...
