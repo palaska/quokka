@@ -323,13 +323,13 @@ class TaskGraph:
                 partition_key_1, target_total_channels // source_total_channels
             )
 
+    # @palaska: Lower inputs' target infos and persist them into PFT
     def prologue(
         self,
         streams: dict[SourceDataStreamIndex, TaskGraphNodeId],
         placement_strategy: PlacementStrategy,
         source_target_info: dict[SourceDataStreamIndex, TargetInfo],
-    ):
-
+    ) -> list[polars.DataFrame]:
         def partition_key_str(key, data, source_channel, num_target_channels):
 
             result = {}
@@ -384,7 +384,7 @@ class TaskGraph:
 
         for key in streams:
             assert key in source_target_info
-            source = streams[key]
+            source: TaskGraphNodeId = streams[key]
             sources.append(source)
             mapping[source] = key
 
@@ -444,15 +444,17 @@ class TaskGraph:
         sources = list(mapping.keys())
         stages = self.AST.mget(self.r, sources)
         assert all([i is not None for i in stages]), "source stages not found"
-        stage_sources = {}
+        stage_sources: Dict[StageId, list[TaskGraphNodeId]] = {}
         for i in range(len(stages)):
-            stage = int(stages[i])
+            stage: StageId = int(stages[i])
             source = sources[i]
             if stage not in stage_sources:
                 stage_sources[stage] = []
             stage_sources[stage].append(source)
 
-        input_reqs = []
+        # each element represent a stage's input requirements
+        # input requirements are {input task graph node id}{channel id}{min seq = 0}
+        input_reqs: list[polars.DataFrame] = []
 
         for stage in sorted(stage_sources.keys()):
             # print(self.current_actor, stage)
@@ -470,6 +472,7 @@ class TaskGraph:
                 source_channel_ids.extend(range(num_channels))
                 # @palaska: for 4 channels, [0, 0, 0, 0], we extend this list for every actor
                 min_seqs.extend([0] * num_channels)
+
             input_reqs.append(
                 polars.from_dict(
                     {
@@ -517,7 +520,7 @@ class TaskGraph:
         if len(assume_sorted) > 0:
             self.SAT.set(pipe, self.current_actor, pickle.dumps(assume_sorted))
 
-        channel_locs = {}
+        channel_locs: Dict[ChannelId, TaskManagerId] = {}
         if type(placement_strategy) == SingleChannelStrategy:
 
             node = self.context.leader_compute_nodes[0]
@@ -545,7 +548,7 @@ class TaskGraph:
                 if type(placement_strategy) == CustomChannelsStrategy
                 else sorted(self.context.tag_compute_nodes[placement_strategy.tag])
             )
-            count = 0
+            count: ChannelId = 0
             for node in nodes:
                 for channel in range(placement_strategy.channels_per_node):
                     exec_task = ExecutorTask(

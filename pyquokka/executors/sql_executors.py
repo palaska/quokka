@@ -495,7 +495,7 @@ class BuildProbeJoinExecutor(Executor):
         self.key_to_keep = key_to_keep
         self.things_seen = []
 
-    def execute(self, batches, stream_id, executor_id):
+    def execute(self, batches, stream_id: SourceDataStreamIndex, executor_id):
         # state compaction
         batches = [
             polars.from_arrow(i) for i in batches if i is not None and len(i) > 0
@@ -506,6 +506,7 @@ class BuildProbeJoinExecutor(Executor):
 
         self.things_seen.append((stream_id, len(batches)))
 
+        # @palaska: stream id can be 0 or 1, which is the index of the input stream
         # build
         if stream_id == 1:
             assert self.phase == "build", (

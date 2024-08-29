@@ -157,7 +157,7 @@ class TaskManager(ITaskManager):
         return True
 
     def init(self):
-        self.actor_flight_clients = {}
+        self.actor_flight_clients: dict[TaskGraphNodeId, dict[ChannelId, Any]] = {}
         keys = self.CLT.keys(self.r)
         values = self.CLT.mget(self.r, keys)
         for key, value in zip(keys, values):
@@ -361,12 +361,13 @@ class TaskManager(ITaskManager):
             else:
                 return True
 
+    # @palaska: partition the output, push data to target actors using flight clients for each channel.
     def push(
         self,
-        source_actor_id: int,
-        source_channel_id: int,
+        source_actor_id: TaskGraphNodeId,
+        source_channel_id: ChannelId,
         seq: int,
-        output: pyarrow.Table,
+        output: Optional[pyarrow.Table],
         target_mask=None,
         from_local=False,
     ):
@@ -395,6 +396,7 @@ class TaskManager(ITaskManager):
             if target_mask is not None and target_actor_id not in target_mask:
                 continue
 
+            # @palaska: the partition_fn is aware of the number of channels (based on target task graph node) it needs to partition into
             partition_fn = partition_fns[target_actor_id]
             # this will be a dict of channel -> Polars DataFrame
 
@@ -405,6 +407,7 @@ class TaskManager(ITaskManager):
             else:
 
                 start_part = time.time()
+                # @palaska: now the outputs is a list of polars dataframes, each dataframe is a partition corresponding to a channel
                 outputs = partition_fn(output, source_channel_id)
                 print_if_profile("partitioner time", time.time() - start_part)
                 start_spill = time.time()
@@ -439,6 +442,7 @@ class TaskManager(ITaskManager):
                 if target_channel_id in outputs and len(outputs[target_channel_id]) > 0:
                     data = outputs[target_channel_id]
                     # set the partition function number to 0 for now because we won't ever be changing the partition function.
+                    # @palaska: HUH?
                     name = (
                         source_actor_id,
                         source_channel_id,
@@ -591,7 +595,14 @@ class ExecTaskManager(TaskManager):
 
         self.tape_input_reqs = {}
 
-    def output_commit(self, transaction, actor_id, channel_id, out_seq, lineage):
+    def output_commit(
+        self,
+        transaction,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        out_seq: OutSeq,
+        lineage: StateSeq,
+    ):
 
         if self.configs["fault_tolerance"]:
             name_prefix = pickle.dumps((actor_id, channel_id, out_seq))
@@ -641,7 +652,7 @@ class ExecTaskManager(TaskManager):
                         # you failed to push downstream, most likely due to node failure. wait a bit for coordinator recovery and continue, most like will be choked on barrier.
                         time.sleep(0.2)
                         return -1
-                else:
+                else:  # task graph node is blocking
                     transform_fn, dataset, dataset_id = self.blocking_nodes[actor_id]
                     if transform_fn is not None:
                         data = transform_fn(data)
@@ -738,6 +749,7 @@ class ExecTaskManager(TaskManager):
 
                 input_requirements = candidate_task.input_reqs
 
+                # self.dst is now a polars dataframe that contains taskgraphnodeid, channelid, done_seq
                 self.update_dst()
 
                 if self.dst is not None:
@@ -745,6 +757,7 @@ class ExecTaskManager(TaskManager):
                     assert type(input_requirements) == list
 
                     new_input_requirements = (
+                        # @palaska: input_requirements are a list for every stage, sorted by stage id ASC
                         input_requirements[0]
                         .join(
                             self.dst,
@@ -758,16 +771,20 @@ class ExecTaskManager(TaskManager):
 
                     # print("refershing", actor_id, channel_id, input_requirements, self.dst.filter(polars.col("source_actor_id")==0), new_input_requirements)
 
+                    # lowest stage in input reqs are done, so we can remove them
                     if len(new_input_requirements) == 0:
                         input_requirements = input_requirements[1:]
                     else:
+                        # lowest stage is still in progress, however some seqs might be done
                         input_requirements = [
                             new_input_requirements
                         ] + input_requirements[1:]
 
                 transaction = self.r.pipeline()
 
+                # @palaska: out_seq is used to track which seqs we have processed in each channel
                 out_seq = candidate_task.out_seq
+                # @palaska: state_seq is used for triggering a checkpoint and also used in fault tolerance
                 state_seq = candidate_task.state_seq
 
                 input_names = []
@@ -866,7 +883,7 @@ class ExecTaskManager(TaskManager):
                         self.index += 1
                         continue
 
-                    # @palaska: Why do we expect only one source TaskGraphNode? What about Joins?
+                    # @palaska: We do joins in two phases: build and probe phase and call execute for each phase(or input) separately.
                     assert len(source_actor_ids) == 1
                     source_actor_id = source_actor_ids.pop()
 
@@ -958,7 +975,7 @@ class ExecTaskManager(TaskManager):
                             max_seq,
                         )
 
-                else:
+                else:  # no input requirements left, we should be done
                     output = self.function_objects[actor_id, channel_id].done(
                         channel_id
                     )
@@ -1008,7 +1025,10 @@ class ExecTaskManager(TaskManager):
                 self.EST.set(
                     transaction, pickle.dumps((actor_id, channel_id)), state_seq
                 )
+                # @palaska: only needed for fault tolerance
                 self.state_commit(transaction, actor_id, channel_id, state_seq, lineage)
+
+                # @palaska: this removes the candidate_task from NTT and adds the next task with the updated input_requirements/state_seq/out_seq
                 self.task_commit(transaction, candidate_task, next_task)
 
                 executed = transaction.execute()

@@ -4,10 +4,12 @@ can't use different Redis DBs because that's not best practice, and you can't do
 to do a transaction here just take out r.pipeline on the main redis client that's passed in to construct these tables.
 """
 
+import polars
 from pyquokka.target_info import TargetInfo
 from pyquokka.types import (
     ChannelId,
     ChannelSeqId,
+    IpAddress,
     StageId,
     TaskManagerId,
     TaskType,
@@ -15,7 +17,7 @@ from pyquokka.types import (
     TaskGraphNodeId,
 )
 import ray.cloudpickle as pickle
-from typing import Dict, Generic, Iterable, Optional, Tuple, TypeVar
+from typing import Dict, Generic, Iterable, Optional, Sequence, Tuple, TypeVar
 
 K = TypeVar("K")
 V = TypeVar("V")
@@ -58,7 +60,7 @@ class ClientWrapper(Generic[K, V]):
         key = self.wrap_key(key)
         return redis_client.get(key)
 
-    def mget(self, redis_client, keys: Iterable[K]) -> Iterable[V]:
+    def mget(self, redis_client, keys: Sequence[K]) -> Sequence[V]:
         keys = [self.wrap_key(key) for key in keys]
         return redis_client.mget(keys)
 
@@ -296,11 +298,15 @@ class ExecutorStateTable(ClientWrapper):
 """
 
 
-class ChannelLocationTable(ClientWrapper):
+class ChannelLocationTable(
+    ClientWrapper[TaskGraphNodeIdChannelIdTupleBytes, IpAddress]
+):
     def __init__(self) -> None:
         super().__init__("CLT")
 
-    def to_dict(self, redis_client):
+    def to_dict(
+        self, redis_client
+    ) -> Dict[Tuple[TaskGraphNodeId, ChannelId], IpAddress]:
         keys = self.keys(redis_client)
         values = self.mget(redis_client, keys)
         return {pickle.loads(key): value for key, value in zip(keys, values)}
@@ -325,11 +331,15 @@ class FunctionObjectTable(ClientWrapper[TaskGraphNodeId, ReaderOrExecutorBytes])
 """
 
 
-class InputRequirementsTable(ClientWrapper):
+class InputRequirementsTable(
+    ClientWrapper[TaskGraphNodeIdChannelIdChannelSeqIdTupleBytes, bytes]
+):
     def __init__(self) -> None:
         super().__init__("IRT")
 
-    def to_dict(self, redis_client):
+    def to_dict(
+        self, redis_client
+    ) -> Dict[Tuple[TaskGraphNodeId, ChannelId, ChannelSeqId], list[polars.DataFrame]]:
         keys = self.keys(redis_client)
         values = self.mget(redis_client, keys)
         return {
@@ -361,6 +371,7 @@ class SortedActorsTable(ClientWrapper):
 SourceToTargetTaskGraphNodeIdsBytes = bytes
 
 
+# stores lowered target infos (with a function partitioner etc)
 class PartitionFunctionTable(
     ClientWrapper[SourceToTargetTaskGraphNodeIdsBytes, TargetInfo]
 ):

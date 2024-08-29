@@ -14,6 +14,7 @@ from typing import (
 )
 
 import polars
+import pyarrow
 import sqlglot
 
 NodeId = int
@@ -155,6 +156,13 @@ class IQuokkaContext:
     ) -> polars.DataFrame | polars.Series | IDataset | None: ...
 
 
+NextTask = Any
+
+
 class Reader(Protocol):
 
     def get_own_state(self, num_channels: int) -> Dict[ChannelId, List[SeqInfo]]: ...
+
+    def execute(
+        self, channel_id: ChannelId, SeqInfo
+    ) -> Tuple[NextTask, pyarrow.Table]: ...
