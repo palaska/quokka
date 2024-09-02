@@ -1,8 +1,8 @@
 import ray
 import ray.cloudpickle as pickle
 import redis
-from pyquokka.task import * 
-from pyquokka.tables import * 
+from pyquokka.task import *
+from pyquokka.tables import *
 import pyarrow
 import pyarrow.flight
 import polars
@@ -10,13 +10,15 @@ import time
 import pandas as pd
 import math
 
+from pyquokka.types import ICoordinator
+
 DEBUG =  True
 def print_if_debug(*x):
     if DEBUG:
         print(*x)
 
 @ray.remote
-class Coordinator:
+class Coordinator(ICoordinator):
     def __init__(self) -> None:
 
         self.r = redis.Redis('localhost', 6800, db = 0)
@@ -37,7 +39,7 @@ class Coordinator:
 
         # input channel locations don't have to be tracked
         self.actor_channel_locations = {}
-    
+
     def dump_redis_state(self, path):
         state = {"CT": self.CT.to_dict(self.r),
         "NOT": self.NOT.to_dict(self.r),
@@ -66,9 +68,9 @@ class Coordinator:
         self.replay_nodes = set(replay_nodes.keys())
         self.io_nodes = set(io_nodes.keys())
         self.compute_nodes = set(compute_nodes.keys())
-        
+
         self.node_handles = {**replay_nodes, **io_nodes, **compute_nodes}
-    
+
     def register_node_ips(self, node_ip_address):
         self.node_ip_address = node_ip_address
         self.ip_replay_node = {}
@@ -86,7 +88,7 @@ class Coordinator:
 
     def update_undone(self):
         # you only ever need the actor, channel pairs that have been registered in self.actor_flight_clients
-        
+
         to_remove = set()
         for actor_id in self.undone:
             interested_channels = list(self.undone[actor_id])
@@ -96,15 +98,15 @@ class Coordinator:
                     continue
                 # print("done seq", seq)
                 self.undone[actor_id].remove(channel_id)
-            
+
             if len(self.undone[actor_id]) == 0:
                 to_remove.add(actor_id)
-        
+
         for actor_id in to_remove:
             del self.undone[actor_id]
 
     def update_execution_stage(self):
-        
+
         # based on self.ast and self.undone, compute what execution stage you are in right now
         # and update the execution stage in redis
         # basically you need to check if any undone actors have the current stage, if so you cannot progress
@@ -123,7 +125,7 @@ class Coordinator:
                     raise Exception
                 if stage == current_stage:
                     return
-            
+
             # print("PROGRESSING STAGE TO ", current_stage + 1)
             self.r.set("current-execution-stage", current_stage + 1)
 
@@ -136,7 +138,7 @@ class Coordinator:
         self.r.set("current-execution-stage", min(self.ast.values()))
         execute_handles = {worker : self.node_handles[worker].execute.remote() for worker in self.node_handles}
         execute_handles_list = list(execute_handles.values())
-        
+
         stage_timer = time.time()
 
         while True:
@@ -147,7 +149,7 @@ class Coordinator:
                 # print("finished", finished, "unfinished", unfinished)
                 assert len(unfinished) == len(execute_handles_list), "no execute method should terminate on its own" + str(ray.get(finished))
 
-                self.update_undone()                
+                self.update_undone()
                 if len(self.undone) == 0:
                     # wipe task manager state after execution of a TaskGraph.
                     self.r.set("finish-execution",  1)
@@ -155,14 +157,14 @@ class Coordinator:
                     old_stage = self.r.get("current-execution-stage")
                     print("STAGE {} took {} seconds".format(old_stage, time.time() - stage_timer))
                     return
-                
+
                 old_stage = self.r.get("current-execution-stage")
                 self.update_execution_stage()
                 new_stage = self.r.get("current-execution-stage")
                 if new_stage != old_stage:
                     print("STAGE {} took {} seconds".format(old_stage, time.time() - stage_timer))
                     stage_timer = time.time()
-                    
+
 
             except ray.exceptions.RayActorError:
                 print("detected failure")
@@ -180,7 +182,7 @@ class Coordinator:
                             alive_nodes.append(worker)
                         except:
                             failed_nodes.append(worker)
-                        
+
                     # print("alive", alive_nodes)
                     # print("failed", failed_nodes)
                     for failed_node in failed_nodes:
@@ -189,12 +191,12 @@ class Coordinator:
                     waiting_workers = [int(i) for i in self.r.smembers("waiting-workers")]
                     # print(waiting_workers)
 
-                    # this guarantees that at this point, all the alive nodes are waiting. 
+                    # this guarantees that at this point, all the alive nodes are waiting.
                     # note this does not guarantee that during recovery, all the alive nodes will stay alive, which might not be true.
-                    # failed nodes will basically be forgotten about the system. 
+                    # failed nodes will basically be forgotten about the system.
                     if set(alive_nodes).issubset(set(waiting_workers)):
                         break
-                
+
                 print("WORKER BARRIER TOOK", time.time() - start)
                 start = time.time()
                 self.recover(alive_nodes, failed_nodes)
@@ -203,11 +205,11 @@ class Coordinator:
                 print("RECOVERY PLANNING TOOK", time.time() - start)
                 execute_handles = {worker: execute_handles[worker] for worker in alive_nodes}
                 execute_handles_list = list(execute_handles.values())
-            
+
             except Exception as e:
                 print(e)
                 raise e
-            
+
 
     '''
     The strategy here is that we are going to guarantee that every current running task or future task will have inputs pushed to them.
@@ -267,8 +269,8 @@ class Coordinator:
                 remembered_input_reqs[actor,task_id] = d[actor, task_id, seq]
 
 
-        # you can safely delete all objects this node stores UNLESS there is a replay task asking for it. 
-        # other objects are purely for fault recovery. Instead of remaking them here, why not just remake them 
+        # you can safely delete all objects this node stores UNLESS there is a replay task asking for it.
+        # other objects are purely for fault recovery. Instead of remaking them here, why not just remake them
         # when another failure asks for them. Do as little work as possible!
 
         lost_objects = set.union( *[self.NOT.smembers(self.r, failed_node) for failed_node in failed_nodes ])
@@ -285,8 +287,8 @@ class Coordinator:
                 # 2) they are not going to be present elsewhere, since an object is only ever present on one node
                 # yes currently if you need object seq 10 and you are on seq 20, you have to rewind all the way back to 10
                 # this is to make sure there is only one task anywhere in the system executing a channel, even for different nonoverlapping seq numbers
-                # this is mainly done to conserve memory. Even though you can totally make seq 10 and continue processing seq 20 onwards separately, you 
-                # need two copies of the channel's state to do this. An alternative could be that we remember where we are at seq 20, and after we 
+                # this is mainly done to conserve memory. Even though you can totally make seq 10 and continue processing seq 20 onwards separately, you
+                # need two copies of the channel's state to do this. An alternative could be that we remember where we are at seq 20, and after we
                 # remake seq 10 fast forward to seq 20. This is too complicated right now.
 
                 actor_id, channel_id, out_seq = pickle.loads(object)
@@ -302,28 +304,28 @@ class Coordinator:
                         new_input_requests[actor_id, channel_id].add(out_seq)
 
             assert self.PT.delete(self.r, object) == 1
-        
+
         for task in exec_tasks:
 
             if (task.actor_id, task.channel_id) in rewind_requests:
                 rewind_requests[task.actor_id, task.channel_id] = min(rewind_requests[task.actor_id, task.channel_id], find_lastest_valid_ckpt(task.actor_id, task.channel_id, task.state_seq))
             else:
                 rewind_requests[task.actor_id, task.channel_id] = find_lastest_valid_ckpt(task.actor_id, task.channel_id, task.state_seq)
-        
+
         for task in exectape_tasks:
 
             if (task.actor_id, task.channel_id) in rewind_requests:
                 rewind_requests[task.actor_id, task.channel_id] = min(rewind_requests[task.actor_id, task.channel_id], find_lastest_valid_ckpt(task.actor_id, task.channel_id, task.state_seq))
             else:
                 rewind_requests[task.actor_id, task.channel_id] = find_lastest_valid_ckpt(task.actor_id, task.channel_id, task.state_seq)
-            
+
             # you don't have to record input_reqs since you will never need it. There never will be a scenario where you are a exectape task
             # and your last_known_seq == state_seq
 
         for task in input_tasks:
 
             remembered_input_objects[task.actor_id, task.channel_id] = (task.seq, task.input_object)
-        
+
         for task in inputtape_tasks:
 
             if (task.actor_id, task.channel_id) not in new_input_requests:
@@ -333,9 +335,9 @@ class Coordinator:
                     new_input_requests[task.actor_id, task.channel_id].add(seq)
 
 
-        # at the end of the recovery process, we have to ensure that 
+        # at the end of the recovery process, we have to ensure that
         # 1) tasks running before on failed node must be running elsewhere
-        # 2) all these tasks will have their inputs pushed to them. 
+        # 2) all these tasks will have their inputs pushed to them.
 
         # we are going backwards in topological order. This is super important! If the ordering is not right this won't work.
         for actor_id in self.topological_order:
@@ -413,7 +415,7 @@ class Coordinator:
                             # you can replay all of them.
                             for seq, loc in zip(input_seqs, where):
                                 replay_requests.append((source_actor_id, source_channel_id, loc, seq, actor_id, channel_id))
-        
+
 
         print(rewind_requests)
         print(new_input_requests)
@@ -446,7 +448,7 @@ class Coordinator:
 
                                 assert self.NTT.lrem(self.r, str(node_id),1 , task_str) == 1
                                 break
-                        
+
                         elif name == "exectape":
                             task = TapedExecutorTask.from_tuple(tup)
                             if task.actor_id == actor_id and task.channel_id == channel_id:
@@ -454,7 +456,7 @@ class Coordinator:
                                 assert self.NTT.lrem(self.r, str(node_id),1 , task_str) == 1
                                 last_known_seq = task.last_state_seq
                                 break
-            
+
 
             # must make sure you pick an ExecTaskManager not an IOTaskManager!
             alive_compute_nodes = [k for k in alive_nodes if k in self.compute_nodes]
@@ -464,7 +466,7 @@ class Coordinator:
 
             unlucky_one = random.choice(alive_compute_nodes)
 
-            # the coordinator must NOT register the function object. Instead when a node realizes it doesn't have the function object it should go fetch it somewhere. 
+            # the coordinator must NOT register the function object. Instead when a node realizes it doesn't have the function object it should go fetch it somewhere.
             # the coordinator only ever touches the control data stores. It cannot do physical operations like RPCs!
             if last_known_seq == state_seq:
                 # you are recovering right into a checkpoint
@@ -499,7 +501,7 @@ class Coordinator:
             unlucky_one = random.choice(ip_to_alive_io_nodes[ip])
 
             assert unlucky_one is not None
-            
+
             self.NTT.lpush(self.r, unlucky_one, InputTask(actor_id, channel_id, seq, input_object).reduce())
 
         # now do the taped input tasks. This should pretty much be everything after the "Merge"
@@ -508,7 +510,7 @@ class Coordinator:
         for actor_id, channel_id in new_input_requests:
             if actor_id not in actor_ids:
                 actor_ids.add(actor_id)
-        
+
         # you want to interleave the alive io nodes by IP address so things are evenly balanced. How good are you at Python anyways?
         alive_io_nodes = [val for tup in zip(*list(ip_to_alive_io_nodes.values())) for val in tup]
         if len(alive_io_nodes) == 0:
@@ -538,7 +540,7 @@ class Coordinator:
                     a, c = tup
                     seqs = df.seq.to_list()
                     self.NTT.lpush(self.r, alive_io_nodes[k], TapedInputTask(int(a), int(c), [int(i) for i in seqs]).reduce())
-        
+
         replay_requests = pd.DataFrame(replay_requests, columns = ['source_actor_id','source_channel_id','location','seq', 'target_actor_id', 'target_channel_id'])
         for location, location_df in replay_requests.groupby('location'):
             assert int(location) in alive_nodes, (location, alive_nodes)
@@ -550,6 +552,6 @@ class Coordinator:
             for tup, df in location_df.groupby(["source_actor_id", "source_channel_id"]):
                 source_actor_id, source_channel_id = tup
                 self.NTT.lpush(self.r, replay_node, ReplayTask(source_actor_id, source_channel_id, polars.from_pandas(df[["seq", "target_actor_id", "target_channel_id"]])).reduce())
-        
+
         if DEBUG:
             self.dump_redis_state("post.pkl")

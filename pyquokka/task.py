@@ -2,85 +2,128 @@ from collections import deque
 import random
 import pickle
 
-'''
+import pyarrow
+from pyquokka.executors.base_executor import Executor
+from pyquokka.types import (
+    ChannelId,
+    ChannelSeqId,
+    ExecutorTaskTuple,
+    InputObject,
+    InputReqs,
+    InputTaskTuple,
+    LastStateSeq,
+    OutSeq,
+    ReplaySpecs,
+    ReplayTaskTuple,
+    StateSeq,
+    TapedExecutorTaskTuple,
+    TapedInputTaskTuple,
+    SourceDataStreamIndex,
+    TaskGraphNodeId,
+)
+
+"""
 The names of objects are (source_actor_id, source_channel_id, seq, target_actor_id, partition_fn, target_channel_id)
-'''
+"""
+
+
 class Object:
     def __init__(self, name: tuple, data) -> None:
         assert len(name) == 6
         self.tuple_name = name
         self.data = data
-    
+
     @property
     def source_actor_id(self):
         return self.tuple_name[0]
-    
+
     @property
     def source_channel_id(self):
         return self.tuple_name[1]
-    
+
     @property
     def seq(self):
         return self.tuple_name[2]
-    
+
     @property
     def target_actor_id(self):
         return self.tuple_name[3]
-    
+
     @property
     def partition_fn(self):
         return self.tuple_name[4]
-    
+
     @property
     def target_channel_id(self):
         return self.tuple_name[5]
-    
+
     @property
     def name(self):
         return pickle.dumps(self.tuple_name)
 
+
 class Task:
-    def __init__(self, actor_id, channel_id) -> None:
+    def __init__(self, actor_id: TaskGraphNodeId, channel_id: ChannelId) -> None:
         self.actor_id = actor_id
         self.channel_id = channel_id
 
+
 class InputTask(Task):
-    def __init__(self, actor_id, channel_id, seq, input_object) -> None:
+    def __init__(
+        self,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        seq: ChannelSeqId,
+        input_object: InputObject,
+    ) -> None:
 
         print("Initializing InputTask, this is odd as its use should be discontinued.")
         super().__init__(actor_id, channel_id)
         self.input_object = input_object
         self.seq = seq
-    
+
     @classmethod
-    def from_tuple(cls, tup):
+    def from_tuple(cls, tup: InputTaskTuple):
         assert len(tup) == 4
         return cls(tup[0], tup[1], tup[2], tup[3])
 
     def reduce(self):
-        return pickle.dumps(("input",(self.actor_id, self.channel_id, self.seq, self.input_object)))
+        return pickle.dumps(
+            ("input", (self.actor_id, self.channel_id, self.seq, self.input_object))
+        )
 
     def execute(self, functionObject):
 
-        # any object, Polars DataFrame    
-        next_input_object, result = functionObject.execute(self.channel_id, self.input_object)
+        # any object, Polars DataFrame
+        next_input_object, result = functionObject.execute(
+            self.channel_id, self.input_object
+        )
 
         # needs to return the next task to launch if any, the result and the lineage
         if next_input_object is not None:
-            return InputTask(self.actor_id, self.channel_id, self.seq + 1, next_input_object), result, self.seq, pickle.dumps(self.input_object)
+            return (
+                InputTask(
+                    self.actor_id, self.channel_id, self.seq + 1, next_input_object
+                ),
+                result,
+                self.seq,
+                pickle.dumps(self.input_object),
+            )
         else:
-            # you are done. 
+            # you are done.
             return None, result, self.seq, pickle.dumps(self.input_object)
 
 
 class TapedInputTask(Task):
-    def __init__(self, actor_id, channel_id, tape ) -> None:
-        super().__init__(actor_id,channel_id)
+    def __init__(
+        self, actor_id: TaskGraphNodeId, channel_id: ChannelId, tape: list[ChannelSeqId]
+    ) -> None:
+        super().__init__(actor_id, channel_id)
         assert len(tape) > 0
         self.tape = tape
-    
+
     @classmethod
-    def from_tuple(cls, tup):
+    def from_tuple(cls, tup: TapedInputTaskTuple):
         assert len(tup) == 3
         return cls(tup[0], tup[1], tup[2])
 
@@ -96,13 +139,21 @@ class TapedInputTask(Task):
 
         seq = self.tape[0]
 
-        # we don't care what's the next thing we are supposed to read       
-        next_input_object, result = functionObject.execute(self.channel_id, input_object)
+        # we don't care what's the next thing we are supposed to read
+        next_input_object, result = functionObject.execute(
+            self.channel_id, input_object
+        )
 
         if len(self.tape) == 1:
             return None, result, seq, None
         else:
-            return TapedInputTask(self.actor_id, self.channel_id, self.tape[1:]), result, seq, None
+            return (
+                TapedInputTask(self.actor_id, self.channel_id, self.tape[1:]),
+                result,
+                seq,
+                None,
+            )
+
 
 """
 An example input_reqs is a Polars DataFrame that looks like this:
@@ -116,57 +167,108 @@ source_actor_id, source_channel_id, seq
 1, 2, 4
 """
 
+
 class ExecutorTask(Task):
-    def __init__(self, actor_id, channel_id, state_seq, out_seq, input_reqs) -> None:
+    def __init__(
+        self,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        state_seq: StateSeq,
+        out_seq: OutSeq,
+        input_reqs: InputReqs,
+    ) -> None:
         super().__init__(actor_id, channel_id)
         self.input_reqs = input_reqs
         self.state_seq = state_seq
         self.out_seq = out_seq
 
     @classmethod
-    def from_tuple(cls, tup):
+    def from_tuple(cls, tup: ExecutorTaskTuple):
         assert len(tup) == 5, tup
         return cls(tup[0], tup[1], tup[2], tup[3], tup[4])
 
-    def execute(self, functionObject, inputs, stream_id, channel_id):
+    def execute(
+        self,
+        functionObject: Executor,
+        inputs: list[pyarrow.Table],
+        stream_id: SourceDataStreamIndex,
+        channel_id: ChannelId,
+    ):
         # print("Executing ExecutorTask", self.actor_id, self.channel_id, self.state_seq, self.out_seq)
         output = functionObject.execute(inputs, stream_id, channel_id)
-        return output, self.state_seq, self.out_seq 
+        return output, self.state_seq, self.out_seq
 
     def reduce(self):
-        return pickle.dumps(("exec", (self.actor_id, self.channel_id, self.state_seq, self.out_seq, self.input_reqs)))
+        return pickle.dumps(
+            (
+                "exec",
+                (
+                    self.actor_id,
+                    self.channel_id,
+                    self.state_seq,
+                    self.out_seq,
+                    self.input_reqs,
+                ),
+            )
+        )
+
 
 class TapedExecutorTask(Task):
-    def __init__(self, actor_id, channel_id, state_seq, out_seq, last_state_seq) -> None:
+    def __init__(
+        self,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        state_seq: StateSeq,
+        out_seq: OutSeq,
+        last_state_seq: LastStateSeq,
+    ) -> None:
         super().__init__(actor_id, channel_id)
         self.state_seq = state_seq
         self.out_seq = out_seq
         self.last_state_seq = last_state_seq
 
     @classmethod
-    def from_tuple(cls, tup):
+    def from_tuple(cls, tup: TapedExecutorTaskTuple):
         assert len(tup) == 5, tup
         return cls(tup[0], tup[1], tup[2], tup[3], tup[4])
 
     def execute(self, functionObject, inputs, stream_id, channel_id):
         # print("Executing TapedExecutorTask", self.actor_id, self.channel_id, self.state_seq, self.out_seq, self.last_state_seq)
         output = functionObject.execute(inputs, stream_id, channel_id)
-        return output, self.state_seq, self.out_seq 
+        return output, self.state_seq, self.out_seq
 
     def reduce(self):
-        return pickle.dumps(("exectape", (self.actor_id, self.channel_id, self.state_seq, self.out_seq, self.last_state_seq)))
+        return pickle.dumps(
+            (
+                "exectape",
+                (
+                    self.actor_id,
+                    self.channel_id,
+                    self.state_seq,
+                    self.out_seq,
+                    self.last_state_seq,
+                ),
+            )
+        )
 
 
 class ReplayTask(Task):
-    def __init__(self, actor_id, channel_id, replay_specification) -> None:
+    def __init__(
+        self,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        replay_specification: ReplaySpecs,
+    ) -> None:
         super().__init__(actor_id, channel_id)
         self.replay_specification = replay_specification
         self.needed_seqs = replay_specification["seq"].unique().to_list()
-    
+
     @classmethod
-    def from_tuple(cls, tup):
+    def from_tuple(cls, tup: ReplayTaskTuple):
         assert len(tup) == 3, tup
         return cls(tup[0], tup[1], tup[2])
 
     def reduce(self):
-        return pickle.dumps(("replay", (self.actor_id, self.channel_id, self.replay_specification)))
+        return pickle.dumps(
+            ("replay", (self.actor_id, self.channel_id, self.replay_specification))
+        )

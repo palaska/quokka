@@ -1,8 +1,11 @@
 import os
-# os.environ["POLARS_MAX_THREADS"] = "1" 
+
+# os.environ["POLARS_MAX_THREADS"] = "1"
 import polars
 import pandas as pd
-os.environ['ARROW_DEFAULT_MEMORY_POOL'] = 'system'
+
+os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
+from pyquokka.types import ChannelId, SourceDataStreamIndex
 import redis
 import pyarrow as pa
 import time
@@ -23,10 +26,18 @@ import multiprocessing
 from pyquokka.windowtypes import *
 from threadpoolctl import threadpool_limits
 
+
 class Executor:
     def __init__(self) -> None:
         raise NotImplementedError
-    def execute(self,batches,stream_id, executor_id):
+
+    def execute(
+        self,
+        batches: list[pa.Table],
+        stream_id: SourceDataStreamIndex,
+        executor_id: ChannelId,
+    ) -> pa.Table:
         raise NotImplementedError
-    def done(self,executor_id):
+
+    def done(self, executor_id: ChannelId):
         raise NotImplementedError

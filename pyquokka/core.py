@@ -1,11 +1,13 @@
+from typing import Any, Callable, cast
+from pyquokka.target_info import TargetInfo
 import ray
 import pyarrow
 import pyarrow.flight
 import ray.cloudpickle as pickle
 import redis
-from pyquokka.hbq import * 
-from pyquokka.task import * 
-from pyquokka.tables import * 
+from pyquokka.hbq import *
+from pyquokka.task import *
+from pyquokka.tables import *
 import pyquokka.sql_utils as sql_utils
 import polars
 import time
@@ -16,6 +18,16 @@ import concurrent.futures
 import duckdb
 import gc
 
+from pyquokka.types import (
+    DatasetId,
+    IDatasetManager,
+    ITaskManager,
+    NumTotalChannels,
+    Reader,
+    SourceDataStreamIndex,
+    TaskType,
+)
+
 MAX_SEQ = 1000000000
 DEBUG = False
 PROFILE = False
@@ -25,63 +37,90 @@ def print_if_debug(*x):
     if DEBUG:
         print(*x)
 
+
 def print_if_profile(*x):
     if PROFILE:
         print(*x, time.time())
 
+
 def record_batches_to_table(batches):
 
-    aligned_batches = [pyarrow.record_batch([pyarrow.concat_arrays([arr]) for arr in batch], schema=batch.schema) for batch in batches]
+    aligned_batches = [
+        pyarrow.record_batch(
+            [pyarrow.concat_arrays([arr]) for arr in batch], schema=batch.schema
+        )
+        for batch in batches
+    ]
     return pyarrow.Table.from_batches(aligned_batches)
+
 
 class ConnectionError(Exception):
     pass
 
-'''
+
+"""
 
 The names of objects are (source_actor_id, source_channel_id, seq, target_actor_id, target_actor_id, partition_fn, target_channel_id)
 Each object can have only one producing task and one consuming task.
-i.e. only one consuming task can be present on the cluster'''
+i.e. only one consuming task can be present on the cluster"""
 
-'''
+"""
 What is in the local cache, this is organized as primary key nodeid, channel -> set of values
 This reflects how objects are actually stored in the cache.
-An example: 
+An example:
 {(0,0) -> ((0,0,0),(1,0,0),(2,0,0)), (0,1) -> }
-'''
+"""
+
+TargetTaskGraphNodeId = TaskGraphNodeId
+SourceTaskGraphNodeId = TaskGraphNodeId
 
 
-class TaskManager:
+class TaskManager(ITaskManager):
 
-    def __init__(self, node_id : int, coordinator_ip : str, worker_ips:list, configs = None) -> None:
+    def __init__(
+        self, node_id: int, coordinator_ip: str, worker_ips: list, configs=None
+    ) -> None:
 
         gc.disable()
         self.configs = configs
 
-        self.node_id = node_id
-        self.mappings = {}
-        self.function_objects = {}
+        self.node_id: TaskManagerId = node_id
+        self.mappings: dict[
+            TargetTaskGraphNodeId, dict[SourceTaskGraphNodeId, SourceDataStreamIndex]
+        ] = {}
+        self.function_objects: dict[
+            tuple[TaskGraphNodeId, ChannelId], Reader | Executor
+        ] = {}
 
         # key is source_actor_id, value is another dict of target_actor_id: fn
-        self.partition_fns = {}
-        self.target_count = {}
+        self.partition_fns: dict[
+            SourceTaskGraphNodeId, dict[TargetTaskGraphNodeId, Callable]
+        ] = {}
 
-        self.blocking_nodes = {}
+        self.target_count: dict[SourceTaskGraphNodeId, int] = {}
 
-        self.dst = None
+        self.blocking_nodes: dict[
+            TaskGraphNodeId, tuple[Callable, IDatasetManager, DatasetId]
+        ] = {}
+
+        self.dst: Optional[polars.DataFrame] = None
 
         # this defines how this object is going to push outputs
         self.flight_client = pyarrow.flight.connect("grpc://0.0.0.0:5005")
-        self.r = redis.Redis(coordinator_ip, 6800, db = 0)
+        self.r = redis.Redis(coordinator_ip, 6800, db=0)
 
         self.clear_flights(self.flight_client)
-        self.flight_clients = {i: pyarrow.flight.connect("grpc://" + str(i) + ":5005") for i in worker_ips}
+        self.flight_clients = {
+            i: pyarrow.flight.connect("grpc://" + str(i) + ":5005") for i in worker_ips
+        }
 
         #  Bytedance can write this.
         self.HBQ = HBQ(self.configs["hbq_path"])
-  
+
         if coordinator_ip == "localhost":
-            print("Warning: coordinator_ip set to localhost. This only makes sense for local deployment.")
+            print(
+                "Warning: coordinator_ip set to localhost. This only makes sense for local deployment."
+            )
 
         self.CT = CemetaryTable()
         self.NOT = NodeObjectTable()
@@ -96,8 +135,8 @@ class TaskManager:
         self.AST = ActorStageTable()
         self.EWT = ExecutorWatermarkTable()
 
-        # populate this dictionary from the initial assignment 
-            
+        # populate this dictionary from the initial assignment
+
         self.self_flight_client = pyarrow.flight.connect("grpc://0.0.0.0:5005")
 
         # self.tasks = deque()
@@ -118,43 +157,62 @@ class TaskManager:
         return True
 
     def init(self):
-        self.actor_flight_clients = {}
+        self.actor_flight_clients: dict[TaskGraphNodeId, dict[ChannelId, Any]] = {}
         keys = self.CLT.keys(self.r)
         values = self.CLT.mget(self.r, keys)
         for key, value in zip(keys, values):
             actor, channel = pickle.loads(key)
-            ip = value.decode('utf-8')
+            ip = value.decode("utf-8")
             if actor in self.actor_flight_clients:
                 self.actor_flight_clients[actor][channel] = self.flight_clients[ip]
             else:
-                self.actor_flight_clients[actor] = {channel : self.flight_clients[ip]}
+                self.actor_flight_clients[actor] = {channel: self.flight_clients[ip]}
         return True
 
     def alive(self):
-        return True        
+        return True
 
     def update_dst(self):
         # you only ever need the actor, channel pairs that have been registered in self.actor_flight_clients
-        
-        keys = self.DST.keys(self.r)
-        seqs = [int(i) for i in self.DST.mget(self.r, keys)]
-        actor_ids = [pickle.loads(k)[0] for k in keys]
-        channel_ids = [pickle.loads(k)[1] for k in keys]
+
+        keys = self.DST.keys(self.r)  # TaskGraphNodeId, ChannelId pairs
+        seqs: list[ChannelSeqId] = [int(i) for i in self.DST.mget(self.r, keys)]
+        actor_ids: list[TaskGraphNodeId] = [pickle.loads(k)[0] for k in keys]
+        channel_ids: list[ChannelId] = [pickle.loads(k)[1] for k in keys]
 
         if len(seqs) > 0:
-            self.dst = polars.from_dict({"source_actor_id": actor_ids, "source_channel_id": channel_ids, "done_seq": seqs})
+            self.dst = polars.from_dict(
+                {
+                    "source_actor_id": actor_ids,
+                    "source_channel_id": channel_ids,
+                    "done_seq": seqs,
+                }
+            )
 
-    
-    def register_partition_function(self, source_actor_ids, target_actor_id, number_target_channels, mapping):
+    def register_partition_function(
+        self,
+        source_actor_ids: list[TaskGraphNodeId],
+        target_actor_id: TaskGraphNodeId,
+        number_target_channels: NumTotalChannels,
+        mapping: dict[TaskGraphNodeId, SourceDataStreamIndex],
+    ):
 
         self.mappings[target_actor_id] = mapping
 
-        def partition_fn(predicate_fn, partitioner_fn, batch_funcs, projection, num_target_channels, x, source_channel):
+        def partition_fn(
+            predicate_fn,
+            partitioner_fn,
+            batch_funcs,
+            projection,
+            num_target_channels,
+            x,
+            source_channel,
+        ):
 
             start = time.time()
             # x could be either a pyarrow table of a polars dataframe
             if type(predicate_fn) == str:
-                con = duckdb.connect().execute('PRAGMA threads=%d' % 8)
+                con = duckdb.connect().execute("PRAGMA threads=%d" % 8)
                 batch_arrow = x.to_arrow() if type(x) == polars.DataFrame else x
                 x = con.execute(predicate_fn).arrow()
                 try:
@@ -198,37 +256,54 @@ class TaskManager:
         # for the moment let's assume that no autoscaling happens and this doesn't change.
 
         for source_actor_id in source_actor_ids:
-            target_info = ray.cloudpickle.loads(self.PFT.get(self.r, pickle.dumps((source_actor_id, target_actor_id))))
+            target_info: TargetInfo = ray.cloudpickle.loads(
+                self.PFT.get(self.r, pickle.dumps((source_actor_id, target_actor_id)))
+            )
             try:
                 target_info.predicate = sql_utils.evaluate(target_info.predicate)
             except:
-                target_info.predicate = "select * from batch_arrow where " + target_info.predicate.sql(dialect = "duckdb") 
-            partition_function = partial(partition_fn, target_info.predicate, target_info.partitioner, target_info.batch_funcs, target_info.projection, number_target_channels)
+                target_info.predicate = (
+                    "select * from batch_arrow where "
+                    + target_info.predicate.sql(dialect="duckdb")
+                )
+            partition_function = partial(
+                partition_fn,
+                target_info.predicate,
+                target_info.partitioner,
+                target_info.batch_funcs,
+                target_info.projection,
+                number_target_channels,
+            )
 
             if source_actor_id not in self.partition_fns:
-                self.partition_fns[source_actor_id] = {target_actor_id: partition_function}
+                self.partition_fns[source_actor_id] = {
+                    target_actor_id: partition_function
+                }
             else:
-                self.partition_fns[source_actor_id][target_actor_id] = partition_function
-            
+                self.partition_fns[source_actor_id][
+                    target_actor_id
+                ] = partition_function
+
             if source_actor_id not in self.target_count:
                 self.target_count[source_actor_id] = number_target_channels
             else:
                 self.target_count[source_actor_id] += number_target_channels
-        
+
         return True
 
-    
-    def register_blocking(self, actor_id, transform_fn, dataset_object, dataset_id):
+    def register_blocking(
+        self, actor_id: TaskGraphNodeId, transform_fn, dataset_object, dataset_id
+    ):
         self.blocking_nodes[actor_id] = (transform_fn, dataset_object, dataset_id)
         return True
 
     def check_in_recovery(self):
-        if self.r.get("recovery-lock") == b'1':
+        if self.r.get("recovery-lock") == b"1":
             print("Recovery request detected, I am going to wait ", self.node_id)
-            self.r.sadd("waiting-workers",  self.node_id)
+            self.r.sadd("waiting-workers", self.node_id)
             while True:
                 time.sleep(0.01)
-                if self.r.get("recovery-lock") == b'0':
+                if self.r.get("recovery-lock") == b"0":
                     self.actor_flight_clients = {}
 
                     # update your routing table first!
@@ -236,15 +311,19 @@ class TaskManager:
                     values = self.CLT.mget(self.r, keys)
                     for key, value in zip(keys, values):
                         actor, channel = pickle.loads(key)
-                        ip = value.decode('utf-8')
+                        ip = value.decode("utf-8")
                         # print("reset", actor, channel, ip)
                         if actor in self.actor_flight_clients:
-                            self.actor_flight_clients[actor][channel] = self.flight_clients[ip]
+                            self.actor_flight_clients[actor][channel] = (
+                                self.flight_clients[ip]
+                            )
                         else:
-                            self.actor_flight_clients[actor] = {channel : self.flight_clients[ip]}
+                            self.actor_flight_clients[actor] = {
+                                channel: self.flight_clients[ip]
+                            }
                     break
             print("exitted recovery loop", self.node_id)
-    
+
     def clear_flights(self, client):
         buf = pyarrow.allocate_buffer(0)
         action = pyarrow.flight.Action("clear", buf)
@@ -252,43 +331,63 @@ class TaskManager:
             if result.body.to_pybytes().decode("utf-8") != "True":
                 print(result.body.to_pybytes().decode("utf-8"))
                 raise Exception
-    
+
     def set_flight_configs(self, client):
 
-        message = pyarrow.py_buffer(pickle.dumps({"mem_limit" : self.configs["memory_limit"], "max_batches" : self.configs["max_pipeline_batches"], "actor_stages": self.ast, "batch_attempt": self.configs["batch_attempt"]}))
+        message = pyarrow.py_buffer(
+            pickle.dumps(
+                {
+                    "mem_limit": self.configs["memory_limit"],
+                    "max_batches": self.configs["max_pipeline_batches"],
+                    "actor_stages": self.ast,
+                    "batch_attempt": self.configs["batch_attempt"],
+                }
+            )
+        )
         action = pyarrow.flight.Action("set_configs", message)
         for result in list(client.do_action(action)):
             if result.body.to_pybytes().decode("utf-8") != "True":
                 print(result.body.to_pybytes().decode("utf-8"))
                 raise Exception
-    
+
     def check_puttable(self, client):
         buf = pyarrow.allocate_buffer(0)
         action = pyarrow.flight.Action("check_puttable", buf)
         for result in list(client.do_action(action)):
-            #print(result.body.to_pybytes().decode("utf-8"))
+            # print(result.body.to_pybytes().decode("utf-8"))
             if result.body.to_pybytes().decode("utf-8") != "True":
                 print("BACKPRESSURING!")
                 return False
             else:
                 return True
 
-    def push(self, source_actor_id: int, source_channel_id: int, seq: int, output: pyarrow.Table, target_mask = None, from_local = False):
-        
+    # @palaska: partition the output, push data to target actors using flight clients for each channel.
+    def push(
+        self,
+        source_actor_id: TaskGraphNodeId,
+        source_channel_id: ChannelId,
+        seq: int,
+        output: Optional[pyarrow.Table],
+        target_mask=None,
+        from_local=False,
+    ):
+
         start_push = time.time()
 
-        my_format = "polars" # let's not worry about different formats for now though that will be needed eventually
-        
+        my_format = "polars"  # let's not worry about different formats for now though that will be needed eventually
+
         if target_mask is not None:
             print_if_debug("TARGET_MASK", target_mask)
-        
+
         partition_fns = self.partition_fns[source_actor_id]
 
         start_convert = time.time()
         if output is None:
             assert from_local
         else:
-            assert type(output) == pyarrow.Table or type(output) == polars.DataFrame, "push data type {} not understood".format(type(output))
+            assert (
+                type(output) == pyarrow.Table or type(output) == polars.DataFrame
+            ), "push data type {} not understood".format(type(output))
 
         print_if_profile("convert time", time.time() - start_convert)
 
@@ -297,42 +396,73 @@ class TaskManager:
             if target_mask is not None and target_actor_id not in target_mask:
                 continue
 
+            # @palaska: the partition_fn is aware of the number of channels (based on target task graph node) it needs to partition into
             partition_fn = partition_fns[target_actor_id]
             # this will be a dict of channel -> Polars DataFrame
 
             if from_local:
-                outputs = self.HBQ.get(source_actor_id, source_channel_id, seq, target_actor_id)
+                outputs = self.HBQ.get(
+                    source_actor_id, source_channel_id, seq, target_actor_id
+                )
             else:
 
                 start_part = time.time()
+                # @palaska: now the outputs is a list of polars dataframes, each dataframe is a partition corresponding to a channel
                 outputs = partition_fn(output, source_channel_id)
                 print_if_profile("partitioner time", time.time() - start_part)
                 start_spill = time.time()
                 if self.configs["fault_tolerance"]:
-                    self.HBQ.put(source_actor_id, source_channel_id, seq, target_actor_id, outputs)
+                    self.HBQ.put(
+                        source_actor_id,
+                        source_channel_id,
+                        seq,
+                        target_actor_id,
+                        outputs,
+                    )
                 print_if_profile("disk spill time", time.time() - start_spill)
 
             # print(outputs)
-            
+
             # print(source_actor_id, source_channel_id, seq)
 
             if target_mask is not None:
-                channels_to_do = [channel for channel in self.actor_flight_clients[target_actor_id] if channel in target_mask[target_actor_id]]
+                channels_to_do = [
+                    channel
+                    for channel in self.actor_flight_clients[target_actor_id]
+                    if channel in target_mask[target_actor_id]
+                ]
             else:
-                channels_to_do = [channel for channel in self.actor_flight_clients[target_actor_id]]
-            
+                channels_to_do = [
+                    channel for channel in self.actor_flight_clients[target_actor_id]
+                ]
+
             def do_channel(target_channel_id):
 
                 start = time.time()
                 if target_channel_id in outputs and len(outputs[target_channel_id]) > 0:
                     data = outputs[target_channel_id]
                     # set the partition function number to 0 for now because we won't ever be changing the partition function.
-                    name = (source_actor_id, source_channel_id, seq, target_actor_id, 0, target_channel_id)
+                    # @palaska: HUH?
+                    name = (
+                        source_actor_id,
+                        source_channel_id,
+                        seq,
+                        target_actor_id,
+                        0,
+                        target_channel_id,
+                    )
                     batches = data.to_arrow().to_batches()
-                    
+
                 else:
-                    name = (source_actor_id, source_channel_id, seq, target_actor_id, 0, target_channel_id)
-                    batches = [pyarrow.RecordBatch.from_pydict({"__empty__":[]})]
+                    name = (
+                        source_actor_id,
+                        source_channel_id,
+                        seq,
+                        target_actor_id,
+                        0,
+                        target_channel_id,
+                    )
+                    batches = [pyarrow.RecordBatch.from_pydict({"__empty__": []})]
 
                 assert len(batches) == 1, batches
 
@@ -343,12 +473,14 @@ class TaskManager:
                 try:
                     if not self.check_puttable(client):
                         return False
-                    upload_descriptor = pyarrow.flight.FlightDescriptor.for_command(pickle.dumps((True, name, my_format)))
+                    upload_descriptor = pyarrow.flight.FlightDescriptor.for_command(
+                        pickle.dumps((True, name, my_format))
+                    )
                     batch = batches[0]
                     writer, _ = client.do_put(upload_descriptor, batch.schema)
                     # print("Attempting to write ", batch.nbytes, "bytes")
                     if batch.nbytes >= 2e9:
-                        for k in range(0, len(batch), len(batch)//10):
+                        for k in range(0, len(batch), len(batch) // 10):
                             writer.write_batch(batch[k : k + len(batch) // 10])
                     else:
                         writer.write_batch(batch)
@@ -357,45 +489,72 @@ class TaskManager:
                 except pyarrow._flight.FlightUnavailableError:
                     print("downstream unavailable")
                     return False
-                
+
                 # print("finished pushing", source_actor_id, source_channel_id, seq, target_actor_id, target_channel_id, len(batches[0]))
 
-                print_if_profile("pushing to one channel time", time.time() - start, len(batches[0]), batches[0].nbytes)
+                print_if_profile(
+                    "pushing to one channel time",
+                    time.time() - start,
+                    len(batches[0]),
+                    batches[0].nbytes,
+                )
                 return True
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
             futures = {}
             for target_channel_id in channels_to_do:
-                futures[target_channel_id] = executor.submit(do_channel, target_channel_id)
-            
-            result = {target_channel_id:futures[target_channel_id].result() for target_channel_id in channels_to_do}
+                futures[target_channel_id] = executor.submit(
+                    do_channel, target_channel_id
+                )
+
+            result = {
+                target_channel_id: futures[target_channel_id].result()
+                for target_channel_id in channels_to_do
+            }
             if not all(result.values()):
                 return False
 
         print_if_profile("push time", time.time() - start_push)
         return True
-        
-    
+
     def execute(self):
         raise NotImplementedError
 
-    #The task node periodically will run a garbage collection process for its local cache as well as its HBQ. 
+    # The task node periodically will run a garbage collection process for its local cache as well as its HBQ.
     # this can be run every X iterations in the main loop
     def garbage_collect(self):
 
         gcable = []
-        
+
         transaction = self.r.pipeline()
-        for source_actor_id, source_channel_id, seq, target_actor_id in self.HBQ.get_objects():
+        for (
+            source_actor_id,
+            source_channel_id,
+            seq,
+            target_actor_id,
+        ) in self.HBQ.get_objects():
 
             # refer to the comment of the cemetary table in tables.py to understand this logic.
             # basically count is the number of objects in the flight server with the right name prefix, which should be total number of target object slices
-            if self.CT.scard(self.r, pickle.dumps(source_actor_id, source_channel_id, seq)) == self.target_count[source_actor_id]:
-                
-                gcable.append((source_actor_id, source_channel_id, seq, target_actor_id))
-                self.NOT.srem(transaction, self.node_id, pickle.dumps((source_actor_id, source_channel_id, seq)))
-                self.PT.delete(transaction, pickle.dumps((source_actor_id, source_channel_id, seq)))
-                        
+            if (
+                self.CT.scard(
+                    self.r, pickle.dumps(source_actor_id, source_channel_id, seq)
+                )
+                == self.target_count[source_actor_id]
+            ):
+
+                gcable.append(
+                    (source_actor_id, source_channel_id, seq, target_actor_id)
+                )
+                self.NOT.srem(
+                    transaction,
+                    self.node_id,
+                    pickle.dumps((source_actor_id, source_channel_id, seq)),
+                )
+                self.PT.delete(
+                    transaction, pickle.dumps((source_actor_id, source_channel_id, seq))
+                )
+
         assert all(transaction.execute())
         self.HBQ.gc(gcable)
 
@@ -406,35 +565,48 @@ class TaskManager:
             # note when we put task info in the NTT, the info needs to include the entire task, including all the future tasks it could launch. i.e. the tape in taped tasks.
             self.NTT.lrem(transaction, str(self.node_id), 1, candidate_task.reduce())
             self.NTT.rpush(transaction, str(self.node_id), next_task.reduce())
-            
+
         else:
             # this task is not spawning off more tasks, it's considered done
             # most likely it got done from all its input sources
             self.NTT.lrem(transaction, str(self.node_id), 1, candidate_task.reduce())
-        
+
 
 @ray.remote
 class ExecTaskManager(TaskManager):
-    def __init__(self, node_id: int, coordinator_ip: str, worker_ips: list, configs = None) -> None:
-        super().__init__(node_id, coordinator_ip, worker_ips, configs = configs)
+    def __init__(
+        self, node_id: int, coordinator_ip: str, worker_ips: list, configs=None
+    ) -> None:
+        super().__init__(node_id, coordinator_ip, worker_ips, configs=configs)
         self.LCT = LastCheckpointTable()
         self.EST = ExecutorStateTable()
         self.IRT = InputRequirementsTable()
         self.SAT = SortedActorsTable()
 
-        if self.configs["checkpoint_bucket"] is not None and self.configs["fault_tolerance"] and self.configs["checkpoint_interval"] is not None:
+        if (
+            self.configs["checkpoint_bucket"] is not None
+            and self.configs["fault_tolerance"]
+            and self.configs["checkpoint_interval"] is not None
+        ):
             self.checkpoint_bucket = self.configs["checkpoint_bucket"]
-            s3 = boto3.resource('s3')
+            s3 = boto3.resource("s3")
             bucket = s3.Bucket(self.configs["checkpoint_bucket"])
             bucket.objects.all().delete()
 
         self.tape_input_reqs = {}
-    
-    def output_commit(self, transaction, actor_id, channel_id, out_seq, lineage):
+
+    def output_commit(
+        self,
+        transaction,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        out_seq: OutSeq,
+        lineage: StateSeq,
+    ):
 
         if self.configs["fault_tolerance"]:
             name_prefix = pickle.dumps((actor_id, channel_id, out_seq))
-            
+
             self.NOT.sadd(transaction, str(self.node_id), name_prefix)
             self.PT.set(transaction, name_prefix, str(self.node_id))
             # this probably doesn't have to be done transactionally, but why not.
@@ -442,25 +614,35 @@ class ExecTaskManager(TaskManager):
             self.LT.set(transaction, name_prefix, lineage)
         else:
             pass
-    
+
     def state_commit(self, transaction, actor_id, channel_id, state_seq, lineage):
 
         if self.configs["fault_tolerance"]:
 
-            name_prefix = pickle.dumps(('s', actor_id, channel_id, state_seq))
+            name_prefix = pickle.dumps(("s", actor_id, channel_id, state_seq))
             self.LT.set(transaction, name_prefix, lineage)
         else:
             pass
 
-    def process_output(self, actor_id, channel_id, output, transaction, state_seq, out_seq):
+    def process_output(
+        self,
+        actor_id: TaskGraphNodeId,
+        channel_id: ChannelId,
+        output,
+        transaction,
+        state_seq: StateSeq,
+        out_seq: OutSeq,
+    ):
 
         if output is not None:
             if type(output) == pyarrow.Table:
                 output = polars.from_arrow(output)
-            assert type(output) == polars.DataFrame or type(output) == types.GeneratorType
+            assert (
+                type(output) == polars.DataFrame or type(output) == types.GeneratorType
+            )
             if type(output) == polars.DataFrame:
                 output = [output]
-            
+
             for data in output:
                 if actor_id not in self.blocking_nodes:
                     pushed = self.push(actor_id, channel_id, out_seq, data)
@@ -470,13 +652,21 @@ class ExecTaskManager(TaskManager):
                         # you failed to push downstream, most likely due to node failure. wait a bit for coordinator recovery and continue, most like will be choked on barrier.
                         time.sleep(0.2)
                         return -1
-                else:
+                else:  # task graph node is blocking
                     transform_fn, dataset, dataset_id = self.blocking_nodes[actor_id]
                     if transform_fn is not None:
                         data = transform_fn(data)
                     if data is not None:
-                        ray.get(dataset.added_object.remote(dataset_id, ray._private.services.get_node_ip_address(), [ray.put(data.to_arrow(), _owner = dataset), len(data)]))
-                self.output_commit(transaction, actor_id, channel_id, out_seq, state_seq)
+                        ray.get(
+                            dataset.added_object.remote(
+                                dataset_id,
+                                ray._private.services.get_node_ip_address(),
+                                [ray.put(data.to_arrow(), _owner=dataset), len(data)],
+                            )
+                        )
+                self.output_commit(
+                    transaction, actor_id, channel_id, out_seq, state_seq
+                )
 
                 out_seq += 1
         return out_seq
@@ -491,11 +681,13 @@ class ExecTaskManager(TaskManager):
         self.set_flight_configs(self.flight_client)
 
         while True:
-            if self.r.get("finish-execution") == b'1':
+            if self.r.get("finish-execution") == b"1":
                 self.wipe_state()
                 return True
             self.check_in_recovery()
-            self.current_stage = int(self.r.get("current-execution-stage"))
+            self.current_stage = cast(
+                StageId, int(self.r.get("current-execution-stage"))
+            )
 
             count += 1
 
@@ -503,7 +695,17 @@ class ExecTaskManager(TaskManager):
             # we don't need to make sure that the exec tasks respect stages because our input requirements now contain that information
             # that combined with input task stages should gurantee that exec task stages are respected.
             if self.configs["blocking"]:
-                candidate_tasks = [candidate_task for candidate_task in candidate_tasks if self.ast[pickle.loads(candidate_task)[1][0]] <= self.current_stage]
+                candidate_tasks = [
+                    candidate_task
+                    for candidate_task in candidate_tasks
+                    if self.ast[
+                        cast(
+                            tuple[TaskType, tuple[TaskGraphNodeId, ChannelId]],
+                            pickle.loads(candidate_task),
+                        )[1][0]
+                    ]
+                    <= self.current_stage
+                ]
             length = len(candidate_tasks)
             if length == 0:
                 continue
@@ -511,64 +713,110 @@ class ExecTaskManager(TaskManager):
             if count > length - 1:
                 count = count % length
             candidate_task = candidate_tasks[count]
-            task_type, tup = pickle.loads(candidate_task)
-        
-            if task_type == "input" or task_type == "inputtape" or task_type == "replay":
+            task_type, tup = cast(
+                tuple[TaskType, tuple[TaskGraphNodeId, ChannelId]],
+                pickle.loads(candidate_task),
+            )
+
+            if (
+                task_type == "input"
+                or task_type == "inputtape"
+                or task_type == "replay"
+            ):
                 raise Exception("unsupported task type", task_type)
 
             elif task_type == "exec":
                 # time.sleep(1)
-                candidate_task = ExecutorTask.from_tuple(tup)
+                candidate_task = ExecutorTask.from_tuple(cast(ExecutorTaskTuple, tup))
 
                 actor_id = candidate_task.actor_id
                 channel_id = candidate_task.channel_id
 
                 if (actor_id, channel_id) not in self.function_objects:
-                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(self.FOT.get(self.r, actor_id))
+                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(
+                        self.FOT.get(self.r, actor_id)
+                    )
+                    # @palaska: restore is no-op I guess?
                     if candidate_task.state_seq > 0:
                         s3 = boto3.client("s3")
-                        print("RESTORING TO ", candidate_task.state_seq -1 )
-                        self.function_objects[actor_id, channel_id].restore(self.checkpoint_bucket, actor_id, channel_id, candidate_task.state_seq - 1)
+                        print("RESTORING TO ", candidate_task.state_seq - 1)
+                        self.function_objects[actor_id, channel_id].restore(
+                            self.checkpoint_bucket,
+                            actor_id,
+                            channel_id,
+                            candidate_task.state_seq - 1,
+                        )
 
                 input_requirements = candidate_task.input_reqs
 
+                # self.dst is now a polars dataframe that contains taskgraphnodeid, channelid, done_seq
                 self.update_dst()
-                
+
                 if self.dst is not None:
 
                     assert type(input_requirements) == list
-                    
-                    new_input_requirements = input_requirements[0].join(self.dst, on = ["source_actor_id", "source_channel_id"], how = "left")\
-                                                    .fill_null(MAX_SEQ)\
-                                                    .filter(polars.col("min_seq") <= polars.col("done_seq"))\
-                                                    .drop("done_seq")
-                    
+
+                    new_input_requirements = (
+                        # @palaska: input_requirements are a list for every stage, sorted by stage id ASC
+                        input_requirements[0]
+                        .join(
+                            self.dst,
+                            on=["source_actor_id", "source_channel_id"],
+                            how="left",
+                        )
+                        .fill_null(MAX_SEQ)
+                        .filter(polars.col("min_seq") <= polars.col("done_seq"))
+                        .drop("done_seq")
+                    )
+
                     # print("refershing", actor_id, channel_id, input_requirements, self.dst.filter(polars.col("source_actor_id")==0), new_input_requirements)
 
+                    # lowest stage in input reqs are done, so we can remove them
                     if len(new_input_requirements) == 0:
                         input_requirements = input_requirements[1:]
                     else:
-                        input_requirements = [new_input_requirements] + input_requirements[1:]
-                
+                        # lowest stage is still in progress, however some seqs might be done
+                        input_requirements = [
+                            new_input_requirements
+                        ] + input_requirements[1:]
+
                 transaction = self.r.pipeline()
 
+                # @palaska: out_seq is used to track which seqs we have processed in each channel
                 out_seq = candidate_task.out_seq
+                # @palaska: state_seq is used for triggering a checkpoint and also used in fault tolerance
                 state_seq = candidate_task.state_seq
 
                 input_names = []
                 if len(input_requirements) > 0:
 
                     if actor_id in self.sat:
-                        request = ("cache", actor_id, channel_id, input_requirements[0], False, self.sat[actor_id])
+                        request = (
+                            "cache",
+                            actor_id,
+                            channel_id,
+                            input_requirements[0],
+                            False,
+                            self.sat[actor_id],
+                        )
                     else:
-                        request = ("cache", actor_id, channel_id, input_requirements[0], False, None)
+                        request = (
+                            "cache",
+                            actor_id,
+                            channel_id,
+                            input_requirements[0],
+                            False,
+                            None,
+                        )
 
                     # if we can bake logic inside the the flight server we probably should, because that will be baked into C++ at some point.
 
-                    reader = self.flight_client.do_get(pyarrow.flight.Ticket(pickle.dumps(request)))
+                    reader = self.flight_client.do_get(
+                        pyarrow.flight.Ticket(pickle.dumps(request))
+                    )
 
                     # we are going to assume the Flight server gives us results sorted by source_actor_id
-                    
+
                     chunks_list = []
                     names = []
                     # print("=============")
@@ -590,24 +838,38 @@ class ExecTaskManager(TaskManager):
                     # print("=============")
 
                     batches = []
-                    source_actor_ids = set()
-                    source_channel_ids = []
-                    source_channel_seqs = {}
+                    source_actor_ids: set[TaskGraphNodeId] = set()
+                    source_channel_ids: list[ChannelId] = []
+                    source_channel_seqs: dict[ChannelId, list[ChannelSeqId]] = {}
                     for chunks, name in zip(chunks_list, names):
-                        source_actor_id, source_channel_id, seq, target_actor_id, partition_fn, target_channel_id = name
+                        (
+                            source_actor_id,
+                            source_channel_id,
+                            seq,
+                            target_actor_id,
+                            partition_fn,
+                            target_channel_id,
+                        ) = name
 
                         # important bug fix: you must ignore objects whose names are not in LineageTable. This means they have not yet
                         # been committed upstream, which means their lineage could potentially change upon reconstruction!
                         #  we need to guarantee that the resulting batches are still contiguous in terms of their sequence numbers
                         # this is true because only the last batch for every source channel can still be uncommitted.
 
-                        if self.configs["fault_tolerance"] and self.LT.get(self.r, pickle.dumps((source_actor_id, source_channel_id, seq))) is None:
+                        if (
+                            self.configs["fault_tolerance"]
+                            and self.LT.get(
+                                self.r,
+                                pickle.dumps((source_actor_id, source_channel_id, seq)),
+                            )
+                            is None
+                        ):
                             # print("SKIPPING UNCOMMITED STUFF ", source_actor_id, source_channel_id, seq)
                             continue
 
                         input_names.append(name)
                         # print(name)
-                        
+
                         source_actor_ids.add(source_actor_id)
                         if source_channel_id in source_channel_seqs:
                             source_channel_seqs[source_channel_id].append(seq)
@@ -615,35 +877,73 @@ class ExecTaskManager(TaskManager):
                             source_channel_seqs[source_channel_id] = [seq]
 
                         batches.append(chunks)
-                    
+
                     if len(batches) == 0:
                         # print("returned zero batches")
                         self.index += 1
                         continue
 
+                    # @palaska: We do joins in two phases: build and probe phase and call execute for each phase(or input) separately.
                     assert len(source_actor_ids) == 1
                     source_actor_id = source_actor_ids.pop()
 
-                    input = [record_batches_to_table(batch) for batch in batches if sum([len(b) for b in batch]) > 0]
+                    input = [
+                        record_batches_to_table(batch)
+                        for batch in batches
+                        if sum([len(b) for b in batch]) > 0
+                    ]
 
                     start = time.time()
 
                     if len(input) > 0:
-                        output, _ , _ = candidate_task.execute(self.function_objects[actor_id, channel_id], input, self.mappings[actor_id][source_actor_id] , channel_id)
+                        output, _, _ = candidate_task.execute(
+                            cast(Executor, self.function_objects[actor_id, channel_id]),
+                            input,
+                            self.mappings[actor_id][
+                                source_actor_id
+                            ],  # source data stream index
+                            channel_id,
+                        )
                     else:
                         output = None
 
                     print_if_profile("execute time", time.time() - start)
 
                     source_channel_ids = [i for i in source_channel_seqs]
-                    source_channel_progress = [len(source_channel_seqs[i]) for i in source_channel_ids]
-                    progress = polars.from_dict({"source_actor_id": [source_actor_id] * len(source_channel_ids) , "source_channel_id": source_channel_ids, "progress": source_channel_progress})
+                    source_channel_progress = [
+                        len(source_channel_seqs[i]) for i in source_channel_ids
+                    ]
+                    progress = polars.from_dict(
+                        {
+                            "source_actor_id": [source_actor_id]
+                            * len(source_channel_ids),
+                            "source_channel_id": source_channel_ids,
+                            "progress": source_channel_progress,
+                        }
+                    )
                     # progress is guaranteed to have something since len(batches) > 0
 
-                    # print("starting with input reqs", input_requirements[0])      
-                    new_input_reqs = input_requirements[0].join(progress, on = ["source_actor_id", "source_channel_id"], how = "left").fill_null(0)
-                    new_input_reqs = new_input_reqs.with_columns(polars.Series(name = "min_seq", values = new_input_reqs["progress"] + new_input_reqs["min_seq"]))
-                    
+                    # @palaska: progress is a column per taskgraphnode-channel pair, count of processed seqs
+                    # we increment min_seq by adding progress to it
+
+                    # print("starting with input reqs", input_requirements[0])
+                    new_input_reqs = (
+                        input_requirements[0]
+                        .join(
+                            progress,
+                            on=["source_actor_id", "source_channel_id"],
+                            how="left",
+                        )
+                        .fill_null(0)
+                    )
+                    new_input_reqs = new_input_reqs.with_columns(
+                        polars.Series(
+                            name="min_seq",
+                            values=new_input_reqs["progress"]
+                            + new_input_reqs["min_seq"],
+                        )
+                    )
+
                     new_input_reqs = new_input_reqs.drop("progress")
                     # print("progress", actor_id, channel_id, progress, new_input_reqs)
                     # if self.dst is not None:
@@ -651,86 +951,155 @@ class ExecTaskManager(TaskManager):
                     # else:
                     #     print(input_requirements, "None")
 
-                    out_seq = self.process_output(actor_id, channel_id, output, transaction, state_seq, out_seq)
+                    out_seq = self.process_output(
+                        actor_id, channel_id, output, transaction, state_seq, out_seq
+                    )
                     if out_seq == -1:
                         # this aborts the transaction automatically
                         continue
-                    
+
                     # print("next task reqs", [new_input_reqs] + input_requirements[1:])
-                    next_task = ExecutorTask(actor_id, channel_id, state_seq + 1, out_seq, [new_input_reqs] + input_requirements[1:])
+                    next_task = ExecutorTask(
+                        actor_id,
+                        channel_id,
+                        state_seq + 1,
+                        out_seq,
+                        [new_input_reqs] + input_requirements[1:],
+                    )
                     lineage = pickle.dumps((source_actor_id, source_channel_seqs))
                     for source_channel_id in source_channel_seqs:
                         max_seq = max(source_channel_seqs[source_channel_id])
-                        self.EWT.set(transaction, pickle.dumps((source_actor_id, source_channel_id)), max_seq)
+                        self.EWT.set(
+                            transaction,
+                            pickle.dumps((source_actor_id, source_channel_id)),
+                            max_seq,
+                        )
 
-                else:
-                    output = self.function_objects[actor_id, channel_id].done(channel_id)
+                else:  # no input requirements left, we should be done
+                    output = self.function_objects[actor_id, channel_id].done(
+                        channel_id
+                    )
 
-                    out_seq = self.process_output(actor_id, channel_id, output, transaction, state_seq, out_seq)
+                    out_seq = self.process_output(
+                        actor_id, channel_id, output, transaction, state_seq, out_seq
+                    )
                     if out_seq == -1:
                         continue
                     last_output_seq = out_seq - 1
                     # print("DONE", actor_id, channel_id)
-                    self.DST.set(transaction, pickle.dumps((actor_id, channel_id)), last_output_seq)
+                    self.DST.set(
+                        transaction,
+                        pickle.dumps((actor_id, channel_id)),
+                        last_output_seq,
+                    )
                     next_task = None
                     # lineage = pickle.dumps((-1, -1))
 
-                if self.configs["checkpoint_interval"] is not None and state_seq % self.configs["checkpoint_interval"] == 0:
-                    self.function_objects[actor_id, channel_id].checkpoint(self.checkpoint_bucket, actor_id, channel_id, state_seq)
+                if (
+                    self.configs["checkpoint_interval"] is not None
+                    and state_seq % self.configs["checkpoint_interval"] == 0
+                ):
+                    self.function_objects[actor_id, channel_id].checkpoint(
+                        self.checkpoint_bucket, actor_id, channel_id, state_seq
+                    )
                     for source_channel_id in source_channel_ids:
                         for seq in source_channel_seqs[source_channel_id]:
-                            self.CT.sadd(transaction, pickle.dumps((source_actor_id, source_channel_id, seq)), pickle.dumps((actor_id, channel_id)))
+                            self.CT.sadd(
+                                transaction,
+                                pickle.dumps((source_actor_id, source_channel_id, seq)),
+                                pickle.dumps((actor_id, channel_id)),
+                            )
 
-                    self.LCT.rpush(transaction, pickle.dumps((actor_id, channel_id)), pickle.dumps((state_seq, out_seq)))
-                    self.IRT.set(transaction, pickle.dumps((actor_id, channel_id, state_seq)), pickle.dumps([new_input_reqs] + input_requirements[1:]))
-                # this way of logging the lineage probably use less space than a Polars table actually.                        
+                    self.LCT.rpush(
+                        transaction,
+                        pickle.dumps((actor_id, channel_id)),
+                        pickle.dumps((state_seq, out_seq)),
+                    )
+                    self.IRT.set(
+                        transaction,
+                        pickle.dumps((actor_id, channel_id, state_seq)),
+                        pickle.dumps([new_input_reqs] + input_requirements[1:]),
+                    )
+                # this way of logging the lineage probably use less space than a Polars table actually.
 
-                self.EST.set(transaction, pickle.dumps((actor_id, channel_id)), state_seq)                    
+                self.EST.set(
+                    transaction, pickle.dumps((actor_id, channel_id)), state_seq
+                )
+                # @palaska: only needed for fault tolerance
                 self.state_commit(transaction, actor_id, channel_id, state_seq, lineage)
+
+                # @palaska: this removes the candidate_task from NTT and adds the next task with the updated input_requirements/state_seq/out_seq
                 self.task_commit(transaction, candidate_task, next_task)
-                
+
                 executed = transaction.execute()
-                #if not all(executed):
+                # if not all(executed):
                 #    raise Exception(executed)
-                
+
                 if len(input_names) > 0:
                     message = pyarrow.py_buffer(pickle.dumps(input_names))
                     action = pyarrow.flight.Action("cache_garbage_collect", message)
                     for result in list(self.flight_client.do_action(action)):
                         assert result.body.to_pybytes().decode("utf-8") == "True"
-            
+
             elif task_type == "exectape":
-                candidate_task = TapedExecutorTask.from_tuple(tup)
+                candidate_task = TapedExecutorTask.from_tuple(
+                    cast(TapedExecutorTaskTuple, tup)
+                )
                 actor_id = candidate_task.actor_id
                 channel_id = candidate_task.channel_id
                 state_seq = candidate_task.state_seq
 
                 if (actor_id, channel_id) not in self.function_objects:
-                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(self.FOT.get(self.r, actor_id))
+                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(
+                        self.FOT.get(self.r, actor_id)
+                    )
                     assert candidate_task.state_seq >= 0
 
+                    # @palaska: restore doesnt do anything?!
                     if candidate_task.state_seq > 0:
-                        print("RESTORING TO ", state_seq -1 )
-                        self.function_objects[actor_id, channel_id].restore(self.checkpoint_bucket, actor_id, channel_id, state_seq - 1)
-                    
-                    new_input_reqs = pickle.loads(self.IRT.get(self.r, pickle.dumps((actor_id, channel_id, state_seq - 1))))
+                        print("RESTORING TO ", state_seq - 1)
+                        self.function_objects[actor_id, channel_id].restore(
+                            self.checkpoint_bucket, actor_id, channel_id, state_seq - 1
+                        )
+
+                    new_input_reqs = pickle.loads(
+                        self.IRT.get(
+                            self.r, pickle.dumps((actor_id, channel_id, state_seq - 1))
+                        )
+                    )
                     assert new_input_reqs is not None
                     assert (actor_id, channel_id) not in self.tape_input_reqs
                     self.tape_input_reqs[actor_id, channel_id] = new_input_reqs
 
-                name_prefix = pickle.dumps(('s', actor_id, channel_id, state_seq))
+                name_prefix = pickle.dumps(("s", actor_id, channel_id, state_seq))
                 input_requirements = self.LT.get(self.r, name_prefix)
                 assert input_requirements is not None, pickle.loads(name_prefix)
-                
+
                 transaction = self.r.pipeline()
 
                 if len(pickle.loads(input_requirements)[1]) > 0:
                     if actor_id in self.sat:
-                        request = ("cache", actor_id, channel_id, input_requirements, True, self.sat[actor_id])
+                        request = (
+                            "cache",
+                            actor_id,
+                            channel_id,
+                            input_requirements,
+                            True,
+                            self.sat[actor_id],
+                        )
                     else:
-                        request = ("cache", actor_id, channel_id, input_requirements, True, None)
+                        request = (
+                            "cache",
+                            actor_id,
+                            channel_id,
+                            input_requirements,
+                            True,
+                            None,
+                        )
 
-                    reader = self.flight_client.do_get(pyarrow.flight.Ticket(pickle.dumps(request)))
+                    reader = self.flight_client.do_get(
+                        pyarrow.flight.Ticket(pickle.dumps(request))
+                    )
 
                     chunks_list = []
                     names = []
@@ -757,62 +1126,127 @@ class ExecTaskManager(TaskManager):
                         self.index += 1
                         continue
 
-                    source_actor_id, source_channel_seqs = pickle.loads(input_requirements)
+                    source_actor_id, source_channel_seqs = pickle.loads(
+                        input_requirements
+                    )
                     source_channel_ids = list(source_channel_seqs.keys())
-                    source_channel_progress = [len(source_channel_seqs[k]) for k in source_channel_ids]
-                    progress = polars.from_dict({"source_actor_id": [source_actor_id] * len(source_channel_ids) , "source_channel_id": source_channel_ids, "progress": source_channel_progress})
+                    source_channel_progress = [
+                        len(source_channel_seqs[k]) for k in source_channel_ids
+                    ]
+                    progress = polars.from_dict(
+                        {
+                            "source_actor_id": [source_actor_id]
+                            * len(source_channel_ids),
+                            "source_channel_id": source_channel_ids,
+                            "progress": source_channel_progress,
+                        }
+                    )
 
-                    new_input_reqs = self.tape_input_reqs[actor_id, channel_id][0].join(progress, on = ["source_actor_id", "source_channel_id"], how = "left").fill_null(0)
-                    new_input_reqs = new_input_reqs.with_columns(polars.Series(name = "min_seq", values = new_input_reqs["progress"] + new_input_reqs["min_seq"]))
-                    new_input_reqs = new_input_reqs.select(["source_actor_id", "source_channel_id","min_seq"])
+                    new_input_reqs = (
+                        self.tape_input_reqs[actor_id, channel_id][0]
+                        .join(
+                            progress,
+                            on=["source_actor_id", "source_channel_id"],
+                            how="left",
+                        )
+                        .fill_null(0)
+                    )
+                    new_input_reqs = new_input_reqs.with_columns(
+                        polars.Series(
+                            name="min_seq",
+                            values=new_input_reqs["progress"]
+                            + new_input_reqs["min_seq"],
+                        )
+                    )
+                    new_input_reqs = new_input_reqs.select(
+                        ["source_actor_id", "source_channel_id", "min_seq"]
+                    )
                     self.update_dst()
                     if self.dst is not None:
-                        new_input_reqs = new_input_reqs.join(self.dst, on = ["source_actor_id", "source_channel_id"], how = "left")\
-                                                        .fill_null(MAX_SEQ)\
-                                                        .filter(polars.col("min_seq") <= polars.col("done_seq"))\
-                                                        .drop("done_seq")
-                    
-                    if len(new_input_reqs) == 0:
-                        self.tape_input_reqs[actor_id, channel_id] =  self.tape_input_reqs[actor_id, channel_id][1:]
-                    else:
-                        self.tape_input_reqs[actor_id, channel_id] = [new_input_reqs] +  self.tape_input_reqs[actor_id, channel_id][1:]
+                        new_input_reqs = (
+                            new_input_reqs.join(
+                                self.dst,
+                                on=["source_actor_id", "source_channel_id"],
+                                how="left",
+                            )
+                            .fill_null(MAX_SEQ)
+                            .filter(polars.col("min_seq") <= polars.col("done_seq"))
+                            .drop("done_seq")
+                        )
 
-                    input = [record_batches_to_table(batch) for batch in batches if sum([len(b) for b in batch]) > 0]
+                    if len(new_input_reqs) == 0:
+                        self.tape_input_reqs[actor_id, channel_id] = (
+                            self.tape_input_reqs[actor_id, channel_id][1:]
+                        )
+                    else:
+                        self.tape_input_reqs[actor_id, channel_id] = [
+                            new_input_reqs
+                        ] + self.tape_input_reqs[actor_id, channel_id][1:]
+
+                    input = [
+                        record_batches_to_table(batch)
+                        for batch in batches
+                        if sum([len(b) for b in batch]) > 0
+                    ]
 
                     if len(input) > 0:
-                        output, state_seq, out_seq = candidate_task.execute(self.function_objects[actor_id, channel_id], input, self.mappings[actor_id][source_actor_id] , channel_id)
+                        output, state_seq, out_seq = candidate_task.execute(
+                            self.function_objects[actor_id, channel_id],
+                            input,
+                            self.mappings[actor_id][source_actor_id],
+                            channel_id,
+                        )
                     else:
                         state_seq = candidate_task.state_seq
                         out_seq = candidate_task.out_seq
                         output = None
-                        
-                    out_seq = self.process_output(actor_id, channel_id, output, transaction, state_seq, out_seq)
+
+                    out_seq = self.process_output(
+                        actor_id, channel_id, output, transaction, state_seq, out_seq
+                    )
                     if out_seq == -1:
                         continue
-                        
+
                     if state_seq + 1 > candidate_task.last_state_seq:
-                        next_task = ExecutorTask(actor_id, channel_id, state_seq + 1, out_seq, self.tape_input_reqs[actor_id, channel_id])
+                        next_task = ExecutorTask(
+                            actor_id,
+                            channel_id,
+                            state_seq + 1,
+                            out_seq,
+                            self.tape_input_reqs[actor_id, channel_id],
+                        )
                         # print("finished exectape, next input requirement is ", self.tape_input_reqs[actor_id, channel_id])
 
                     else:
-                        next_task = TapedExecutorTask(actor_id, channel_id, state_seq + 1, out_seq, candidate_task.last_state_seq)
+                        next_task = TapedExecutorTask(
+                            actor_id,
+                            channel_id,
+                            state_seq + 1,
+                            out_seq,
+                            candidate_task.last_state_seq,
+                        )
 
                 # this is a "done task"
                 else:
-                    output = self.function_objects[actor_id, channel_id].done(channel_id)
+                    output = self.function_objects[actor_id, channel_id].done(
+                        channel_id
+                    )
                     next_task = None
                     out_seq = candidate_task.out_seq
-                    out_seq = self.process_output(actor_id, channel_id, output, transaction, state_seq, out_seq)
+                    out_seq = self.process_output(
+                        actor_id, channel_id, output, transaction, state_seq, out_seq
+                    )
                     if out_seq == -1:
                         continue
 
-
-                self.EST.set(transaction, pickle.dumps((actor_id, channel_id)), state_seq)
+                self.EST.set(
+                    transaction, pickle.dumps((actor_id, channel_id)), state_seq
+                )
                 self.task_commit(transaction, candidate_task, next_task)
                 executed = transaction.execute()
-                #if not all(executed):
+                # if not all(executed):
                 #    raise Exception(executed)
-            
+
                 # if it's a done task this garbage collection shouldn't happen cause you didn't use any inputs.
                 if next_task is not None:
                     message = pyarrow.py_buffer(pickle.dumps(input_names))
@@ -823,13 +1257,15 @@ class ExecTaskManager(TaskManager):
 
 @ray.remote
 class IOTaskManager(TaskManager):
-    def __init__(self, node_id: int, coordinator_ip: str, worker_ips: list, configs = None) -> None:
-        super().__init__(node_id, coordinator_ip, worker_ips, configs = configs)
+    def __init__(
+        self, node_id: int, coordinator_ip: str, worker_ips: list, configs=None
+    ) -> None:
+        super().__init__(node_id, coordinator_ip, worker_ips, configs=configs)
         self.GIT = GeneratedInputTable()
         self.LIT = LastInputTable()
         self.delay = 0.1
 
-    # while the exectaskmanager should error out and proceed with the next task 
+    # while the exectaskmanager should error out and proceed with the next task
     # if check puttable is not true to relieve pressure on itself, inputs should just be held up.
     def check_puttable(self, client):
         delayed = False
@@ -837,7 +1273,7 @@ class IOTaskManager(TaskManager):
             buf = pyarrow.allocate_buffer(0)
             action = pyarrow.flight.Action("check_puttable", buf)
             for result in list(client.do_action(action)):
-                #print(result.body.to_pybytes().decode("utf-8"))
+                # print(result.body.to_pybytes().decode("utf-8"))
                 if result.body.to_pybytes().decode("utf-8") != "True":
                     print("BACKPRESSURING!")
                     # be nice
@@ -849,12 +1285,12 @@ class IOTaskManager(TaskManager):
                     continue
                 else:
                     return True
-    
+
     def output_commit(self, transaction, actor_id, channel_id, out_seq, lineage):
 
         if self.configs["fault_tolerance"]:
             name_prefix = pickle.dumps((actor_id, channel_id, out_seq))
-            
+
             self.NOT.sadd(transaction, str(self.node_id), name_prefix)
             self.PT.set(transaction, name_prefix, str(self.node_id))
             # this probably doesn't have to be done transactionally, but why not.
@@ -875,7 +1311,7 @@ class IOTaskManager(TaskManager):
         pyarrow.set_cpu_count(8)
         count = -1
         while True:
-            if self.r.get("finish-execution") == b'1':
+            if self.r.get("finish-execution") == b"1":
                 self.wipe_state()
                 return True
             time.sleep(self.delay)
@@ -887,15 +1323,19 @@ class IOTaskManager(TaskManager):
             count += 1
 
             candidate_tasks = self.NTT.lrange(self.r, str(self.node_id), 0, -1)
-            candidate_tasks = [candidate_task for candidate_task in candidate_tasks if self.ast[pickle.loads(candidate_task)[1][0]] <= self.current_stage]
+            candidate_tasks = [
+                candidate_task
+                for candidate_task in candidate_tasks
+                if self.ast[pickle.loads(candidate_task)[1][0]] <= self.current_stage
+            ]
             if len(candidate_tasks) == 0:
                 continue
-            
-            candidate_task = random.sample(candidate_tasks,1 )[0]
+
+            candidate_task = random.sample(candidate_tasks, 1)[0]
             task_type, tup = pickle.loads(candidate_task)
 
             if task_type == "input":
-                
+
                 # candidate_task = InputTask.from_tuple(tup)
                 # actor_id = candidate_task.actor_id
                 # channel_id = candidate_task.channel_id
@@ -904,19 +1344,24 @@ class IOTaskManager(TaskManager):
                 #     self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(self.FOT.get(self.r, actor_id))
 
                 # functionObject = self.function_objects[actor_id, channel_id]
-                
+
                 # start = time.time()
 
                 # next_task, output, seq, lineage = candidate_task.execute(functionObject)
 
                 # print_if_profile("read time", time.time() - start)
-                raise Exception("only taped input tasks are supported now. Raise Github issue with this error message.")
-            
+                raise Exception(
+                    "only taped input tasks are supported now. Raise Github issue with this error message."
+                )
+
             elif task_type == "inputtape":
                 candidate_task = TapedInputTask.from_tuple(tup)
                 seq = candidate_task.tape[0]
 
-                max_consumed_seq = self.EWT.get(self.r, pickle.dumps((candidate_task.actor_id, candidate_task.channel_id)))
+                max_consumed_seq = self.EWT.get(
+                    self.r,
+                    pickle.dumps((candidate_task.actor_id, candidate_task.channel_id)),
+                )
                 if max_consumed_seq is not None:
                     max_consumed_seq = int(max_consumed_seq)
                 else:
@@ -926,22 +1371,28 @@ class IOTaskManager(TaskManager):
 
                 actor_id = candidate_task.actor_id
                 channel_id = candidate_task.channel_id
-                
+
                 if (actor_id, channel_id) not in self.function_objects:
-                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(self.FOT.get(self.r, actor_id))
-                
+                    self.function_objects[actor_id, channel_id] = ray.cloudpickle.loads(
+                        self.FOT.get(self.r, actor_id)
+                    )
+
                 start = time.time()
 
                 functionObject = self.function_objects[actor_id, channel_id]
-                input_object = pickle.loads(self.LT.get(self.r, pickle.dumps((actor_id, channel_id, seq))))
+                input_object = pickle.loads(
+                    self.LT.get(self.r, pickle.dumps((actor_id, channel_id, seq)))
+                )
                 print_if_profile("lineage  time", time.time() - start)
                 start = time.time()
 
-                next_task, output, seq, lineage = candidate_task.execute(functionObject, input_object)
+                next_task, output, seq, lineage = candidate_task.execute(
+                    functionObject, input_object
+                )
                 print_if_profile("read  time", time.time() - start)
-            
+
             else:
-                raise Exception("unsupported task type", task_type)       
+                raise Exception("unsupported task type", task_type)
 
             pushed = self.push(actor_id, channel_id, seq, output)
 
@@ -954,9 +1405,9 @@ class IOTaskManager(TaskManager):
                     self.DST.set(transaction, pickle.dumps((actor_id, channel_id)), seq)
                 if not all(transaction.execute()):
                     pass
-                   # print("COMMITING TRANSACTION FAILED")
-                   # raise Exception
-            
+                # print("COMMITING TRANSACTION FAILED")
+                # raise Exception
+
             # downstream failure detected, will start recovery soon, DO NOT COMMIT!
             else:
                 print("push failed!")
@@ -964,29 +1415,38 @@ class IOTaskManager(TaskManager):
                 time.sleep(0.2)
                 continue
 
+
 @ray.remote
 class ReplayTaskManager(TaskManager):
-    def __init__(self, node_id: int, coordinator_ip: str, worker_ips: list, configs = None) -> None:
-        super().__init__(node_id, coordinator_ip, worker_ips, configs = configs)
-    
+    def __init__(
+        self, node_id: int, coordinator_ip: str, worker_ips: list, configs=None
+    ) -> None:
+        super().__init__(node_id, coordinator_ip, worker_ips, configs=configs)
+
     def replay(self, source_actor_id, source_channel_id, plan):
 
         # plan is going to be a polars dataframe with three columns: seq, target_actor, target_channel
 
-        seqs = plan['seq'].unique().to_list()
-        
+        seqs = plan["seq"].unique().to_list()
+
         for seq in seqs:
 
-            targets = plan.filter(polars.col('seq') == seq).select(["target_actor_id", "target_channel_id"])
-            target_mask_list = targets.groupby('target_actor_id').all().to_dicts()
-            target_mask = {k['target_actor_id'] : k['target_channel_id'] for k in target_mask_list}
+            targets = plan.filter(polars.col("seq") == seq).select(
+                ["target_actor_id", "target_channel_id"]
+            )
+            target_mask_list = targets.groupby("target_actor_id").all().to_dicts()
+            target_mask = {
+                k["target_actor_id"]: k["target_channel_id"] for k in target_mask_list
+            }
 
             # figure out a pythonic way to convert a dataframe to a dict of lists
 
-            pushed = self.push(source_actor_id, source_channel_id, seq, None, target_mask, True)
+            pushed = self.push(
+                source_actor_id, source_channel_id, seq, None, target_mask, True
+            )
             if not pushed:
                 return False
-        
+
         return True
 
     def execute(self):
@@ -994,11 +1454,11 @@ class ReplayTaskManager(TaskManager):
         Let's start with having one functionObject object for each channel.
         This might need to duplicated data etc. future optimization.
         """
-    
+
         pyarrow.set_cpu_count(8)
         count = -1
         while True:
-            if self.r.get("finish-execution") == b'1':
+            if self.r.get("finish-execution") == b"1":
                 self.wipe_state()
                 return True
             self.check_in_recovery()
@@ -1007,17 +1467,21 @@ class ReplayTaskManager(TaskManager):
             count += 1
             length = self.NTT.llen(self.r, str(self.node_id))
             if length == 0:
-                continue 
+                continue
 
             candidate_task = self.NTT.lindex(self.r, str(self.node_id), 0)
             task_type, tup = pickle.loads(candidate_task)
             assert task_type == "replay"
-            
+
             print_if_debug("executing replay")
 
             candidate_task = ReplayTask.from_tuple(tup)
-            
-            replayed = self.replay(candidate_task.actor_id, candidate_task.channel_id, candidate_task.replay_specification)
+
+            replayed = self.replay(
+                candidate_task.actor_id,
+                candidate_task.channel_id,
+                candidate_task.replay_specification,
+            )
             if replayed:
                 self.NTT.lrem(self.r, str(self.node_id), 1, candidate_task.reduce())
             else:
