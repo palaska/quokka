@@ -11,6 +11,7 @@ from pyquokka.types import (
     ChannelSeqId,
     IpAddress,
     StageId,
+    StateSeq,
     TaskManagerId,
     TaskType,
     SourceDataStreamIndex,
@@ -19,7 +20,9 @@ from pyquokka.types import (
 import ray.cloudpickle as pickle
 from typing import Dict, Generic, Iterable, Optional, Sequence, Tuple, TypeVar
 
-K = TypeVar("K")
+import redis
+
+K = TypeVar("K", str, bytes, int)
 V = TypeVar("V")
 
 TaskGraphNodeIdChannelIdTupleBytes = bytes
@@ -40,79 +43,79 @@ class ClientWrapper(Generic[K, V]):
             key = str(key).encode("utf-8")
         return self.key_prefix + b"-" + key
 
-    def srem(self, redis_client, key: K, fields):
+    def srem(self, redis_client: redis.Redis, key: K, fields):
         key = self.wrap_key(key)
         return redis_client.srem(key, *fields)
 
-    def sadd(self, redis_client, key, field):
+    def sadd(self, redis_client: redis.Redis, key: K, field):
         key = self.wrap_key(key)
         return redis_client.sadd(key, field)
 
-    def scard(self, redis_client, key):
+    def scard(self, redis_client: redis.Redis, key: K):
         key = self.wrap_key(key)
         return redis_client.scard(key)
 
-    def set(self, redis_client, key: K, value: V):
+    def set(self, redis_client: redis.Redis, key: K, value: V):
         key = self.wrap_key(key)
         return redis_client.set(key, value)
 
-    def get(self, redis_client, key: K) -> Optional[V]:
+    def get(self, redis_client: redis.Redis, key: K) -> Optional[V]:
         key = self.wrap_key(key)
         return redis_client.get(key)
 
-    def mget(self, redis_client, keys: Sequence[K]) -> Sequence[V]:
+    def mget(self, redis_client: redis.Redis, keys: Sequence[K]) -> Sequence[V]:
         keys = [self.wrap_key(key) for key in keys]
         return redis_client.mget(keys)
 
-    def mset(self, redis_client, vals: Dict[K, V]):
+    def mset(self, redis_client: redis.Redis, vals: Dict[K, V]):
         vals = {self.wrap_key(key): vals[key] for key in vals}
         return redis_client.mset(vals)
 
-    def delete(self, redis_client, key: K):
+    def delete(self, redis_client: redis.Redis, key: K):
         key = self.wrap_key(key)
         return redis_client.delete(key)
 
-    def smembers(self, redis_client, key: K):
+    def smembers(self, redis_client: redis.Redis, key: K):
         key = self.wrap_key(key)
         return redis_client.smembers(key)
 
-    def sismember(self, redis_client, key, value):
+    def sismember(self, redis_client: redis.Redis, key: K, value):
         key = self.wrap_key(key)
         return redis_client.sismember(key, value)
 
-    def srandmember(self, redis_client, key):
+    def srandmember(self, redis_client: redis.Redis, key: K):
         key = self.wrap_key(key)
         return redis_client.srandmember(key)
 
-    def lrem(self, redis_client, key, count, element):
+    def lrem(self, redis_client: redis.Redis, key: K, count, element):
         key = self.wrap_key(key)
         return redis_client.lrem(key, count, element)
 
-    def lpush(self, redis_client, key, value):
+    def lpush(self, redis_client: redis.Redis, key: K, value):
         key = self.wrap_key(key)
         return redis_client.lpush(key, value)
 
-    def rpush(self, redis_client, key, value):
+    def rpush(self, redis_client: redis.Redis, key: K, value):
         key = self.wrap_key(key)
         return redis_client.rpush(key, value)
 
-    def lpop(self, redis_client, key, count=1):
+    def lpop(self, redis_client: redis.Redis, key: K, count=1):
         key = self.wrap_key(key)
         return redis_client.lpop(key, count)
 
-    def llen(self, redis_client, key):
+    def llen(self, redis_client: redis.Redis, key: K):
         key = self.wrap_key(key)
         return redis_client.llen(key)
 
-    def lindex(self, redis_client, key, index):
+    def lindex(self, redis_client: redis.Redis, key: K, index):
         key = self.wrap_key(key)
         return redis_client.lindex(key, index)
 
-    def lrange(self, redis_client, key, start, end) -> list[V]:
+    def lrange(self, redis_client: redis.Redis, key: K, start, end) -> list[V]:
         key = self.wrap_key(key)
         return redis_client.lrange(key, start, end)
 
-    def keys(self, redis_client) -> list[K]:
+    def keys(self, redis_client: redis.Redis) -> list[K]:
         key = self.key_prefix + b"*"
         return [i.replace(self.key_prefix + b"-", b"") for i in redis_client.keys(key)]
 
@@ -283,11 +286,13 @@ class LastCheckpointTable(ClientWrapper):
 """
 
 
-class ExecutorStateTable(ClientWrapper):
+class ExecutorStateTable(ClientWrapper[TaskGraphNodeIdChannelIdTupleBytes, StateSeq]):
     def __init__(self) -> None:
         super().__init__("EST")
 
-    def to_dict(self, redis_client):
+    def to_dict(
+        self, redis_client
+    ) -> Dict[Tuple[TaskGraphNodeId, ChannelId], StateSeq]:
         keys = self.keys(redis_client)
         values = self.mget(redis_client, keys)
         return {pickle.loads(key): value for key, value in zip(keys, values)}
@@ -339,7 +344,7 @@ class InputRequirementsTable(
 
     def to_dict(
         self, redis_client
-    ) -> Dict[Tuple[TaskGraphNodeId, ChannelId, ChannelSeqId], list[polars.DataFrame]]:
+    ) -> Dict[Tuple[TaskGraphNodeId, ChannelId, StateSeq], list[polars.DataFrame]]:
         keys = self.keys(redis_client)
         values = self.mget(redis_client, keys)
         return {

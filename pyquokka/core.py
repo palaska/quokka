@@ -396,7 +396,7 @@ class TaskManager(ITaskManager):
             if target_mask is not None and target_actor_id not in target_mask:
                 continue
 
-            # @palaska: the partition_fn is aware of the number of channels (based on target task graph node) it needs to partition into
+            # @palaska: the partition_fn is a partial that is created by the task graph node's prologue (lower). The partial fn already has the correct number of channels, computed during the lowering.
             partition_fn = partition_fns[target_actor_id]
             # this will be a dict of channel -> Polars DataFrame
 
@@ -1022,10 +1022,22 @@ class ExecTaskManager(TaskManager):
                     )
                 # this way of logging the lineage probably use less space than a Polars table actually.
 
+                """
+                @palaska:
+                Only needed for fault tolerance
+                Persist to ExecutorStateTable: [actor/channel] -> state_seq - This indicates actor-channel combination has completed up to state_seq
+                """
                 self.EST.set(
                     transaction, pickle.dumps((actor_id, channel_id)), state_seq
                 )
-                # @palaska: only needed for fault tolerance
+
+                """
+                @palaska:
+                Only needed for fault tolerance
+                Persist to LineageTable: [actor/channel/state_seq] -> [source_actor, [{ source_channel: [seqs] }]].
+                This indicates for each actor/channel/state_seq, the processed source actor/channel/seqs.
+                For each state_seq, a new entry will be created that shows the processed source seqs.
+                """
                 self.state_commit(transaction, actor_id, channel_id, state_seq, lineage)
 
                 # @palaska: this removes the candidate_task from NTT and adds the next task with the updated input_requirements/state_seq/out_seq

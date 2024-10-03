@@ -35,8 +35,8 @@ TaskGraphNodeId = int
 
 # Tasks
 TaskType = Literal["input", "inputtape", "exec", "exectape", "replay"]
-StateSeq = Any
-OutSeq = Any
+StateSeq = int
+OutSeq = int
 # List[DF[source_actor_id, source_channel_id, min_seq]]
 InputReqs = List[polars.DataFrame]
 LastStateSeq = Any
